@@ -143,6 +143,8 @@ a gold query it stops without writing anything. The evidence text of each questi
 prompt as a hint (`--no-evidence` removes it). `--sql-timeout 30` matches the 30-second limit of the
 official BIRD evaluation. `--min-interval` spaces the model calls so a free plan stays under its
 requests-per-minute limit: use 60 divided by that limit (4 seconds for 15 requests per minute).
+A run stops after 3 model errors in a row (often a daily quota) and keeps its finished rows;
+continue it later with the same command plus `--out <run file> --resume`.
 
 The `bird` metric is the official BIRD execution accuracy: the predicted and gold result sets are
 compared as sets of raw tuples, with no rounding and ignoring row order and duplicates. The default

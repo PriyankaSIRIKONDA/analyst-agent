@@ -72,3 +72,29 @@ def test_min_interval_spaces_consecutive_calls(monkeypatch, sleeps):
     client.complete([], [])
     client.complete([], [])
     assert sleeps == [pytest.approx(0.8)]
+
+
+def test_real_litellm_call_path_runs_offline(monkeypatch):
+    """Go through the real litellm.completion with a mocked answer (no network).
+
+    The other tests replace litellm.completion, so they cannot see problems inside it,
+    such as LiteLLM importing an optional package that is not installed.
+    """
+    real_completion = litellm.completion
+    monkeypatch.setattr(
+        litellm, "completion", lambda **kw: real_completion(mock_response="ok", **kw)
+    )
+    monkeypatch.setattr(litellm, "completion_cost", lambda **kw: 0.0)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_tables",
+                "description": "List the tables.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+    ]
+    client = LiteLLMClient(model="gemini/gemini-3.5-flash-lite")
+    response = client.complete([{"role": "user", "content": "hi"}], tools)
+    assert response.content == "ok"

@@ -3,8 +3,12 @@
 import json
 import sqlite3
 
+import pytest
+
+import run_eval
 from run_eval import (
     Resources,
+    StoppedEarly,
     build_config,
     load_gold,
     oracle_llm,
@@ -13,6 +17,45 @@ from run_eval import (
     run_all,
 )
 from score import execution_match
+
+
+def _read_rows(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_resume_keeps_finished_rows_and_redoes_model_errors(tmp_path):
+    out = tmp_path / "run.jsonl"
+    run_all(parse_args(["--oracle", "--out", str(out), "--limit", "2"]))
+    rows = _read_rows(out)
+    rows[1]["status"], rows[1]["correct"] = "llm_error", False  # as if a quota stopped it
+    out.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    run_all(parse_args(["--oracle", "--out", str(out), "--limit", "3", "--resume"]))
+    rows = _read_rows(out)
+    assert [r["id"] for r in rows] == ["d01", "d02", "d03"]
+    assert all(r["status"] == "ok" for r in rows)
+
+
+def test_resume_refuses_a_file_with_other_settings(tmp_path):
+    out = tmp_path / "run.jsonl"
+    run_all(parse_args(["--oracle", "--out", str(out), "--limit", "1"]))
+    with pytest.raises(SystemExit):
+        run_all(parse_args(["--oracle", "--out", str(out), "--resume", "--metric", "bird"]))
+
+
+def test_run_stops_after_model_errors_in_a_row(tmp_path, monkeypatch):
+    class BrokenClient:
+        def __init__(self, model=None, min_interval_s=0.0):
+            self.model = "broken"
+
+        def complete(self, messages, tools):
+            raise RuntimeError("quota exceeded")
+
+    monkeypatch.setattr(run_eval, "LiteLLMClient", BrokenClient)
+    out = tmp_path / "run.jsonl"
+    with pytest.raises(StoppedEarly):
+        run_all(parse_args(["--out", str(out), "--stop-after-errors", "2"]))
+    assert len(_read_rows(out)) == 2
 
 
 def test_oracle_scores_every_demo_question_correct(tmp_path):

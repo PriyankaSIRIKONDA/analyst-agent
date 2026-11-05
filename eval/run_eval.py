@@ -63,6 +63,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Seconds between LLM calls (60 / your requests-per-minute limit)")
     parser.add_argument("--oracle", action="store_true",
                         help="No LLM: replay the gold SQL through the real tools and scorer")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue the run in --out: keep finished rows, redo model errors")
+    parser.add_argument("--stop-after-errors", type=int, default=3,
+                        help="Stop after this many model errors in a row (0: never stop)")
     return parser.parse_args(argv)
 
 
@@ -174,8 +178,42 @@ def output_path(args: argparse.Namespace) -> Path:
     return args.out_dir / f"run_{stamp}.jsonl"
 
 
+class StoppedEarly(RuntimeError):
+    """The run stopped because the model kept failing (for example, a daily quota)."""
+
+
+# Settings that must match to continue a run file (the git commit may differ).
+RESUME_KEYS = (
+    "model", "use_docs", "use_repair", "use_evidence", "metric", "max_steps", "sql_timeout", "gold",
+)
+
+
+def finished_rows(out_path: Path, config: dict) -> list[dict]:
+    """Rows of an earlier run to keep when resuming: every row except model errors.
+
+    Refuses a file written with other settings, because one run file holds one configuration.
+    """
+    if not out_path.exists():
+        return []
+    lines = out_path.read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(line) for line in lines if line.strip()]
+    wanted = {k: config.get(k) for k in RESUME_KEYS}
+    for row in rows:
+        found = {k: row["config"].get(k) for k in RESUME_KEYS}
+        if found != wanted:
+            raise SystemExit(f"Cannot resume {out_path}: it has other settings ({found}).")
+    return [row for row in rows if row["status"] != "llm_error"]
+
+
 def run_all(args: argparse.Namespace) -> Path:
-    """Run every question, write the JSONL file, and return its path."""
+    """Run every question, write the JSONL file, and return its path.
+
+    With --resume, rows already in --out are kept (model errors are redone) and only the
+    missing questions run. After --stop-after-errors model errors in a row it raises
+    StoppedEarly; the file then holds every row written so far.
+    """
+    if args.resume and args.out is None:
+        raise SystemExit("--resume needs --out (the run file to continue).")
     if args.oracle:
         llm, model = None, "oracle"
     else:
@@ -187,13 +225,25 @@ def run_all(args: argparse.Namespace) -> Path:
 
     out_path = output_path(args)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    kept = finished_rows(out_path, config) if args.resume else []
+    done = {row["id"] for row in kept}
+    todo = [item for item in questions if item["id"] not in done]
+    if args.resume:
+        print(f"Resuming {out_path}: {len(done)} done, {len(todo)} to run.")
+
+    errors_in_a_row = 0
     with out_path.open("w", encoding="utf-8") as out:
-        for i, item in enumerate(questions, start=1):
+        for row in kept:
+            out.write(json.dumps(row) + "\n")
+        for i, item in enumerate(todo, start=1):
             row = run_question(item, args, resources, llm, config)
             out.write(json.dumps(row) + "\n")
             out.flush()
-            print(f"[{i}/{len(questions)}] {item['id']} correct={row['correct']} "
+            print(f"[{i}/{len(todo)}] {item['id']} correct={row['correct']} "
                   f"status={row['status']} steps={row['steps']}")
+            errors_in_a_row = errors_in_a_row + 1 if row["status"] == "llm_error" else 0
+            if args.stop_after_errors and errors_in_a_row >= args.stop_after_errors:
+                raise StoppedEarly(out_path)
     return out_path
 
 
@@ -201,7 +251,13 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if not args.oracle:
         load_dotenv(ROOT / ".env")
-    out_path = run_all(args)
+    try:
+        out_path = run_all(args)
+    except StoppedEarly as stop:
+        print(f"Stopped: {args.stop_after_errors} model errors in a row (often a daily quota).")
+        print(f"Finished rows are kept. To continue later, rerun the same command with "
+              f"--out {stop} --resume")
+        sys.exit(2)
     print(f"Wrote {out_path}")
     print(f"Next: python eval/analyze.py {out_path}")
 

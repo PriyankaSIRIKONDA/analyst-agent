@@ -1,4 +1,4 @@
-litellm
+litellm==1.106.6  # pinned: llm.py passes a private flag of this version
 fastapi
 uvicorn
 pydantic

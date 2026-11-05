@@ -96,6 +96,9 @@ class LiteLLMClient:
                     tools=tools,
                     temperature=self.temperature,
                     num_retries=0,  # we retry here, so litellm must not retry as well
+                    # LiteLLM 1.106 imports its MCP proxy code (and the optional `mcp` package)
+                    # for every call with tools unless this private flag is set.
+                    _skip_mcp_handler=True,
                 )
             except retryable:
                 if attempt == len(RETRY_BACKOFF_S):
