@@ -1,0 +1,10 @@
+litellm
+fastapi
+uvicorn
+pydantic
+numpy
+pandas
+pytest
+python-dotenv
+httpx
+ruff

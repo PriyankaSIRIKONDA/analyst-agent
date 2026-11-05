@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Data: ignore databases except the small demo one
+data/*.db
+!data/demo.db
+
+# Eval outputs: raw runs are not committed (results.md may be)
+results/raw*
+results/run_*.jsonl
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
