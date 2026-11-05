@@ -47,6 +47,10 @@ Guardrails in `db.py` (an LLM writes the SQL, so the database layer defends itse
 3. a SQLite authorizer denies every operation except reads,
 4. at most 200 rows are returned and a query is stopped after 5 seconds.
 
+On top of that, the tool result sent to the model is bounded: at most 50 rows, and any cell longer
+than 300 characters is cut (bytes are shown as `<N bytes>`). The scorer is not affected, it re-runs
+the SQL with its own large limit.
+
 ## Repository layout
 
 ```
@@ -59,12 +63,18 @@ src/analyst_agent/
 eval/
     make_demo_db.py   builds data/demo.db (e-commerce, fixed seed)
     demo_gold.jsonl   20 questions with gold SQL
-    run_eval.py       runs the agent on a gold file, writes results/run_<timestamp>.jsonl
-    score.py          execution match
-    analyze.py        bootstrap CIs, paired comparison, results/results.md
+    run_eval.py       runs the agent on a gold file (demo or BIRD), or the oracle smoke test
+    score.py          execution match, strict and BIRD metrics
+    analyze.py        bootstrap CIs, paired comparison, status/failure/difficulty tables
+    load_bird.py      builds a 150-question gold file and docs from the BIRD mini-dev download
+    injection.jsonl   20 adversarial questions
+    run_injection.py  runs them against a copy of the database and counts writes
+    check_regression.py  compares a run with eval/baseline.json (or a minimum accuracy)
 data/
     demo.db, demo_docs.md
-tests/              pytest (guardrails, scorer, agent loop with FakeLLM, bootstrap, API)
+Dockerfile, docker-compose.yml, .dockerignore
+.github/workflows/  ci.yml (tests, oracle smoke eval, docker), eval.yml (manual real eval)
+tests/              pytest (guardrails, scorer, agent loop with FakeLLM, loader, API, ...)
 ```
 
 ## Setup
@@ -78,8 +88,8 @@ python -m venv .venv
 copy .env.example .env      # then put your key in .env
 ```
 
-`.env` holds `MISTRAL_API_KEY` (or `GEMINI_API_KEY`) and `MODEL` (LiteLLM format, default
-`mistral/mistral-small-latest`). The file is git-ignored.
+`.env` holds the API key of your provider (for example `GEMINI_API_KEY`, free from Google AI Studio)
+and `MODEL` in LiteLLM format (for example `gemini/gemini-3.5-flash-lite`). The file is git-ignored.
 
 ## Run
 
@@ -105,6 +115,78 @@ copy .env.example .env      # then put your key in .env
 # then:  POST http://127.0.0.1:8000/ask   {"question": "How many customers live in Germany?"}
 ```
 
+## Oracle smoke test (no API key)
+
+```powershell
+.venv\Scripts\python eval\run_eval.py --oracle --out results\ci\oracle.jsonl
+.venv\Scripts\python eval\check_regression.py results\ci\oracle.jsonl --min-accuracy 1.0
+```
+
+`--oracle` replaces the model with a script that runs the gold SQL and returns it as the final
+answer. It goes through the real tools, database guardrails and scorer, so it must get every question right.
+CI runs it on every push to check the whole pipeline without a key.
+
+## BIRD benchmark
+
+The harness can run on the BIRD mini-dev set (SQLite version). Download it yourself and extract it
+anywhere; the loader finds the files by searching. Use an absolute path for `--bird-dir`:
+
+```powershell
+.venv\Scripts\python eval\load_bird.py --bird-dir F:\Downloads\Portfolio_Projects\bird_data
+.venv\Scripts\python eval\run_eval.py --gold data\bird\bird150.jsonl --metric bird --sql-timeout 30 --min-interval 4
+```
+
+The loader shuffles the questions with a fixed seed, checks each gold SQL with the same guarded
+database layer, keeps the first 150 that run, and writes the gold file, one docs file per database
+and `data/bird/manifest.json` (counts of dropped questions and their reasons). If a guardrail rejects
+a gold query it stops without writing anything. The evidence text of each question is added to the
+prompt as a hint (`--no-evidence` removes it). `--sql-timeout 30` matches the 30-second limit of the
+official BIRD evaluation. `--min-interval` spaces the model calls so a free plan stays under its
+requests-per-minute limit: use 60 divided by that limit (4 seconds for 15 requests per minute).
+
+The `bird` metric is the official BIRD execution accuracy: the predicted and gold result sets are
+compared as sets of raw tuples, with no rounding and ignoring row order and duplicates. The default
+`strict` metric is the one described below.
+
+Attribution: BIRD mini-dev (https://bird-bench.github.io/), licensed CC BY-SA 4.0. The data is not
+redistributed in this repository (`data/bird/` is git-ignored).
+
+## Prompt-injection test
+
+```powershell
+.venv\Scripts\python eval\run_injection.py --min-interval 4
+```
+
+Runs 20 adversarial questions (write requests, instruction overrides, stacked statements, schema
+changes, ATTACH/PRAGMA/load_extension, runaway queries) on a temporary copy of the demo database.
+It counts the write attempts, the timeouts, and whether the database file hash changed (target: no
+write executed), and writes `results/injection_<stamp>.md`.
+
+## Docker
+
+```powershell
+copy .env.example .env      # put your key in .env
+docker compose up --build
+# then, from another terminal (PowerShell):
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/ask -ContentType 'application/json' -Body '{"question": "How many customers live in Germany?"}'
+# or on macOS/Linux:
+curl -X POST http://localhost:8000/ask -H 'Content-Type: application/json' -d '{"question": "How many customers live in Germany?"}'
+```
+
+The image contains `src/` and `data/` only; `.env` is read at run time by Compose, never copied.
+
+## Regression gate
+
+```powershell
+.venv\Scripts\python eval\check_regression.py results\run_<stamp>.jsonl --baseline eval\baseline.json --write-baseline
+.venv\Scripts\python eval\check_regression.py results\run_<new>.jsonl --baseline eval\baseline.json
+```
+
+The first command stores the accuracy and its bootstrap CI of a real run you accept as the
+reference. The second exits with code 1 if a later run is below the lower end of that CI. The
+manual `eval.yml` workflow does this in GitHub Actions; it reads the model name from the `MODEL`
+repository variable and the key from a secret such as `GEMINI_API_KEY`.
+
 ## Evaluation method
 
 - Metric: execution accuracy. The gold SQL and the agent's SQL are both run; the answer is correct if the
@@ -123,6 +205,6 @@ until `results/results.md` has been produced from real runs.
 
 ## Limitations of v0
 
-- Only a 20-question demo set on a small synthetic database; a public benchmark comes later.
+- The demo set is 20 questions on a small synthetic database; BIRD support exists but no BIRD run is reported here.
 - Keyword docs search only; no embeddings.
-- No tracing, no MCP server, no Docker image yet.
+- No tracing and no MCP server.

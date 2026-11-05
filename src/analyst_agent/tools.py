@@ -11,7 +11,10 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from analyst_agent.db import DEFAULT_ROW_LIMIT, Database
+from analyst_agent.db import DEFAULT_TIMEOUT_S, Database
+
+MODEL_ROW_LIMIT = 50  # rows of a query result that are shown to the model
+MAX_CELL_CHARS = 300  # longer cell values are cut before they are shown to the model
 
 # --------------------------------------------------------------------- docs search
 
@@ -106,7 +109,7 @@ SEARCH_DOCS_SCHEMA = function_schema(
 )
 RUN_SQL_SCHEMA = function_schema(
     "run_sql",
-    f"Run one read-only SQLite SELECT query. At most {DEFAULT_ROW_LIMIT} rows are returned. "
+    f"Run one read-only SQLite SELECT query. At most {MODEL_ROW_LIMIT} rows are returned. "
     "If it fails, the error message is returned so you can fix the query.",
     {"sql": {"type": "string", "description": "A single SELECT or WITH query."}},
     ["sql"],
@@ -116,11 +119,34 @@ RUN_SQL_SCHEMA = function_schema(
 # ------------------------------------------------------------------------ toolbox
 
 
+def shorten_cell(value):
+    """Bound one cell for the model: bytes become '<N bytes>', long text is cut at 300 chars."""
+    if isinstance(value, bytes):
+        return f"<{len(value)} bytes>"
+    text = str(value)
+    if len(text) > MAX_CELL_CHARS:
+        return text[:MAX_CELL_CHARS] + "...[truncated]"
+    return value
+
+
+def shorten_rows(rows: list[list]) -> list[list]:
+    """Apply shorten_cell to every cell of a list of rows."""
+    return [[shorten_cell(v) for v in row] for row in rows]
+
+
 class ToolBox:
     """Holds the database (and docs) and runs tools by name."""
 
-    def __init__(self, db: Database, docs: DocsIndex | None = None):
+    def __init__(
+        self,
+        db: Database,
+        docs: DocsIndex | None = None,
+        model_row_limit: int = MODEL_ROW_LIMIT,
+        sql_timeout_s: float = DEFAULT_TIMEOUT_S,
+    ):
         self.db = db
+        self.model_row_limit = model_row_limit
+        self.sql_timeout_s = sql_timeout_s
         self.docs = docs  # None means search_docs is disabled (the --no-docs ablation)
 
     def schemas(self) -> list[dict]:
@@ -137,11 +163,25 @@ class ToolBox:
             if name == "list_tables":
                 return {"ok": True, "tables": self.db.list_tables()}
             if name == "describe_table":
-                return self.db.describe_table(arguments["table"])
+                return self._describe_table(arguments["table"])
             if name == "search_docs" and self.docs is not None:
                 return {"ok": True, "results": self.docs.search(arguments["query"])}
             if name == "run_sql":
-                return self.db.run_sql(arguments["sql"])
+                return self._run_sql(arguments["sql"])
         except KeyError as exc:
             return {"ok": False, "error": f"Missing argument: {exc}"}
         return {"ok": False, "error": f"Unknown tool: {name}"}
+
+    def _run_sql(self, sql: str) -> dict:
+        """Run the query with the model-facing row limit and cell truncation."""
+        result = self.db.run_sql(sql, limit=self.model_row_limit, timeout_s=self.sql_timeout_s)
+        if result["ok"]:
+            result["rows"] = shorten_rows(result["rows"])
+        return result
+
+    def _describe_table(self, table: str) -> dict:
+        """Describe a table; sample rows get the same cell truncation."""
+        result = self.db.describe_table(table)
+        if result["ok"]:
+            result["sample_rows"] = shorten_rows(result["sample_rows"])
+        return result

@@ -21,3 +21,8 @@ results/run_*.jsonl
 .vscode/
 .idea/
 .DS_Store
+
+# BIRD benchmark data (not redistributed), CI outputs, injection runs
+data/bird/
+results/ci/
+results/injection_*.jsonl

@@ -1,0 +1,39 @@
+name: Eval
+
+# Manual only: this calls the real model. Set the MODEL repository variable (for example
+# gemini/gemini-3.5-flash-lite) and the matching API key secret (for example GEMINI_API_KEY).
+on:
+  workflow_dispatch:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    env:
+      MODEL: ${{ vars.MODEL }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Run the demo evaluation
+        run: python eval/run_eval.py --min-interval ${{ vars.MIN_INTERVAL || '4' }} --out results/ci/eval_run.jsonl
+
+      - name: Check against the baseline
+        run: python eval/check_regression.py results/ci/eval_run.jsonl --baseline eval/baseline.json
+
+      - name: Upload the run file
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-run
+          path: results/ci/eval_run.jsonl

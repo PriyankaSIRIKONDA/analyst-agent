@@ -25,3 +25,30 @@ jobs:
 
       - name: Tests (pytest, FakeLLM only, no API keys needed)
         run: pytest -q
+
+      - name: Smoke eval with the oracle (no API key)
+        run: |
+          python eval/run_eval.py --oracle --out results/ci/oracle.jsonl
+          python eval/check_regression.py results/ci/oracle.jsonl --min-accuracy 1.0
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t analyst-agent .
+
+      - name: Start the container and wait for /health
+        run: |
+          docker run -d --name analyst-agent -p 8000:8000 analyst-agent
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health; then
+              echo
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "The container did not become healthy within 30 seconds."
+          docker logs analyst-agent
+          exit 1

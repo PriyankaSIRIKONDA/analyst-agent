@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -73,9 +74,101 @@ def summarise(rows: list[dict]) -> dict:
     }
 
 
+STATUSES = ("ok", "max_steps", "sql_error", "llm_error", "no_answer")
+FAILURE_REASONS = ("no_sql", "pred_sql_error", "result_mismatch")
+
+
+def status_counts(rows: list[dict]) -> dict[str, int]:
+    """How many questions ended with each agent status."""
+    counts = Counter(r.get("status", "no_answer") for r in rows)
+    return {status: counts.get(status, 0) for status in STATUSES}
+
+
+def failure_reasons(rows: list[dict]) -> dict[str, int]:
+    """Why wrong answers were wrong: no_sql, pred_sql_error or result_mismatch."""
+    counts: Counter = Counter()
+    for r in rows:
+        if not r["correct"]:
+            reason = str(r.get("reason", "")).split(":")[0] or "unknown"
+            counts[reason] += 1
+    return {reason: counts.get(reason, 0) for reason in FAILURE_REASONS}
+
+
+def by_difficulty(rows: list[dict]) -> dict[str, tuple[int, float]]:
+    """Per difficulty label: (number of questions, accuracy). Rows without a label are 'n/a'."""
+    groups: dict[str, list[bool]] = {}
+    for r in rows:
+        groups.setdefault(r.get("difficulty") or "n/a", []).append(bool(r["correct"]))
+    return {label: (len(v), sum(v) / len(v)) for label, v in sorted(groups.items())}
+
+
+def pair_runs(
+    first: list[dict], second: list[dict]
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Match two runs by question id. Raises ValueError if the id sets differ."""
+    by_a = {r["id"]: r for r in first}
+    by_b = {r["id"]: r for r in second}
+    if len(by_a) != len(first) or len(by_b) != len(second):
+        raise ValueError("A run contains the same question id twice; cannot pair the runs.")
+    if set(by_a) != set(by_b):
+        only_a, only_b = sorted(set(by_a) - set(by_b)), sorted(set(by_b) - set(by_a))
+        raise ValueError(
+            "The two runs are not on the same questions: "
+            f"{len(only_a)} ids only in the first (e.g. {only_a[:3]}), "
+            f"{len(only_b)} only in the second (e.g. {only_b[:3]})."
+        )
+    ids = sorted(by_a)
+    a = np.array([1.0 if by_a[i]["correct"] else 0.0 for i in ids])
+    b = np.array([1.0 if by_b[i]["correct"] else 0.0 for i in ids])
+    return ids, a, b
+
+
+def warnings_for(runs: dict[str, list[dict]]) -> list[str]:
+    """One warning per run where the model API failed (those questions are not real misses)."""
+    out = []
+    for name, rows in runs.items():
+        errors = status_counts(rows)["llm_error"]
+        if errors:
+            out.append(
+                f"WARNING: {name} has {errors} llm_error rows (API failures count as wrong "
+                "answers). Re-run before trusting the accuracy."
+            )
+    return out
+
+
 def pct(x: float) -> str:
     """0.835 -> '83.5%'."""
     return f"{100 * x:.1f}%"
+
+
+def config_section(runs: dict[str, list[dict]]) -> list[str]:
+    """The settings of each run (from its first row), so results.md explains itself."""
+    lines = ["## Run configuration", ""]
+    for name, rows in runs.items():
+        config = rows[0].get("config", {}) if rows else {}
+        lines.append(f"- `{name}`: " + (", ".join(f"{k}={v}" for k, v in config.items()) or "n/a"))
+    return lines + [""]
+
+
+def detail_sections(runs: dict[str, list[dict]]) -> list[str]:
+    """Status counts, failure reasons and accuracy by difficulty for each run."""
+    lines = ["", "## Status of each run", "", "| Run | " + " | ".join(STATUSES) + " |"]
+    lines.append("|---|" + "---|" * len(STATUSES))
+    for name, rows in runs.items():
+        counts = status_counts(rows)
+        lines.append(f"| {name} | " + " | ".join(str(counts[s]) for s in STATUSES) + " |")
+    lines += ["", "## Failure reasons (wrong answers only)", ""]
+    lines += ["| Run | " + " | ".join(FAILURE_REASONS) + " |"]
+    lines.append("|---|" + "---|" * len(FAILURE_REASONS))
+    for name, rows in runs.items():
+        reasons = failure_reasons(rows)
+        lines.append(f"| {name} | " + " | ".join(str(reasons[r]) for r in FAILURE_REASONS) + " |")
+    lines += ["", "## Accuracy by difficulty", "", "| Run | Difficulty | N | Accuracy |"]
+    lines.append("|---|---|---|---|")
+    for name, rows in runs.items():
+        for label, (n, acc) in by_difficulty(rows).items():
+            lines.append(f"| {name} | {label} | {n} | {pct(acc)} |")
+    return lines
 
 
 def build_report(runs: dict[str, list[dict]]) -> str:
@@ -83,7 +176,9 @@ def build_report(runs: dict[str, list[dict]]) -> str:
     summaries = {name: summarise(rows) for name, rows in runs.items()}
 
     title = f"## Execution accuracy (95% bootstrap CI, {N_RESAMPLES} resamples)"
-    lines = ["# Results", "", title, ""]
+    lines = ["# Results", ""]
+    lines += config_section(runs)
+    lines += [title, ""]
     lines += [
         "| Run | Model | Docs | Repair | N | Accuracy | 95% CI |",
         "|---|---|---|---|---|---|---|",
@@ -112,14 +207,12 @@ def build_report(runs: dict[str, list[dict]]) -> str:
             f"{s['tool_calls']:.1f} | {s['repairs']:.2f} |"
         )
 
+    lines += detail_sections(runs)
+
     names = list(runs)
     if len(names) == 2:
         first, second = names
-        by_id_a = {r["id"]: r for r in runs[first]}
-        by_id_b = {r["id"]: r for r in runs[second]}
-        shared = sorted(set(by_id_a) & set(by_id_b))
-        a = np.array([1.0 if by_id_a[i]["correct"] else 0.0 for i in shared])
-        b = np.array([1.0 if by_id_b[i]["correct"] else 0.0 for i in shared])
+        shared, a, b = pair_runs(runs[first], runs[second])
         diff, low, high = paired_bootstrap_diff(a, b)
         verdict = "CI excludes 0" if low > 0 or high < 0 else "CI includes 0, no clear difference"
         lines += [
@@ -146,11 +239,16 @@ def main() -> None:
         parser.error("Pass one run, or two runs for a paired comparison.")
 
     runs = {path.stem: load_run(path) for path in args.runs}
-    report = build_report(runs)
+    try:
+        report = build_report(runs)
+    except ValueError as exc:
+        parser.error(str(exc))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(report, encoding="utf-8")
     print(report)
     print(f"Wrote {args.out}")
+    for warning in warnings_for(runs):
+        print(warning)
 
 
 if __name__ == "__main__":

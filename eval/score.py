@@ -4,6 +4,9 @@ A predicted SQL query is correct if it returns the same result set as the gold S
 - rows are compared as multisets (order does not matter) unless the gold SQL has ORDER BY;
 - floats are rounded to 4 decimal places;
 - column names are ignored, column order is not.
+
+A second metric, ``bird``, follows the official BIRD execution accuracy: the two result sets
+are compared as sets of raw tuples (no rounding; order and duplicate rows are ignored).
 """
 
 from __future__ import annotations
@@ -46,8 +49,20 @@ def results_match(gold_rows: list[list], pred_rows: list[list], ordered: bool) -
     return Counter(gold) == Counter(pred)
 
 
-def execution_match(db: Database, gold_sql: str, pred_sql: str | None) -> dict:
-    """Run both queries and compare. Returns {"correct": bool, "reason": str}."""
+def bird_match(gold_rows: list[list], pred_rows: list[list]) -> bool:
+    """BIRD execution accuracy: equal as sets of raw tuples (order, duplicates ignored)."""
+    return {tuple(r) for r in gold_rows} == {tuple(r) for r in pred_rows}
+
+
+def execution_match(
+    db: Database, gold_sql: str, pred_sql: str | None, metric: str = "strict"
+) -> dict:
+    """Run both queries and compare. Returns {"correct": bool, "reason": str}.
+
+    `metric` is "strict" (the default, described at the top of this file) or "bird".
+    """
+    if metric not in ("strict", "bird"):
+        raise ValueError(f"Unknown metric: {metric!r}")
     if not pred_sql or not pred_sql.strip():
         return {"correct": False, "reason": "no_sql"}
 
@@ -59,6 +74,10 @@ def execution_match(db: Database, gold_sql: str, pred_sql: str | None) -> dict:
     if not pred["ok"]:
         return {"correct": False, "reason": f"pred_sql_error: {pred['error']}"}
 
-    if results_match(gold["rows"], pred["rows"], ordered=has_order_by(gold_sql)):
+    if metric == "bird":
+        matched = bird_match(gold["rows"], pred["rows"])
+    else:
+        matched = results_match(gold["rows"], pred["rows"], ordered=has_order_by(gold_sql))
+    if matched:
         return {"correct": True, "reason": "match"}
     return {"correct": False, "reason": "result_mismatch"}

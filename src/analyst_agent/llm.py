@@ -8,9 +8,24 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 
-DEFAULT_MODEL = "mistral/mistral-small-latest"
+DEFAULT_MODEL = "gemini/gemini-3.5-flash-lite"
+RETRY_BACKOFF_S = (2, 4, 8, 16, 32)  # wait before retry 1..5
+RETRYABLE_ERRORS = (
+    "RateLimitError",
+    "APIConnectionError",
+    "Timeout",
+    "InternalServerError",
+    "ServiceUnavailableError",
+)
+
+
+def retryable_exceptions(litellm_module) -> tuple[type, ...]:
+    """The litellm exception classes worth retrying. Names missing in this version are skipped."""
+    found = [getattr(litellm_module, name, None) for name in RETRYABLE_ERRORS]
+    return tuple(e for e in found if isinstance(e, type) and issubclass(e, BaseException))
 
 
 @dataclass
@@ -50,20 +65,47 @@ class LLMResponse:
 class LiteLLMClient:
     """Calls any model supported by LiteLLM. The model name comes from the MODEL env variable."""
 
-    def __init__(self, model: str | None = None, temperature: float = 0.0):
-        self.model = model or os.getenv("MODEL", DEFAULT_MODEL)
+    def __init__(
+        self,
+        model: str | None = None,
+        temperature: float = 0.0,
+        min_interval_s: float = 0.0,
+    ):
+        self.model = model or os.getenv("MODEL") or DEFAULT_MODEL  # empty MODEL -> default
         self.temperature = temperature
+        self.min_interval_s = min_interval_s  # minimum gap between two calls (rate limits)
+        self._last_call = None
+
+    def _wait_for_interval(self) -> None:
+        """Sleep so that consecutive calls are at least min_interval_s apart."""
+        if self.min_interval_s > 0 and self._last_call is not None:
+            wait = self.min_interval_s - (time.monotonic() - self._last_call)
+            if wait > 0:
+                time.sleep(wait)
+        self._last_call = time.monotonic()
+
+    def _completion_with_retries(self, litellm, messages: list[dict], tools: list[dict]):
+        """Call litellm.completion; retry transient errors with a growing wait."""
+        retryable = retryable_exceptions(litellm)
+        for attempt in range(len(RETRY_BACKOFF_S) + 1):
+            self._wait_for_interval()
+            try:
+                return litellm.completion(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools,
+                    temperature=self.temperature,
+                    num_retries=0,  # we retry here, so litellm must not retry as well
+                )
+            except retryable:
+                if attempt == len(RETRY_BACKOFF_S):
+                    raise
+                time.sleep(RETRY_BACKOFF_S[attempt])
 
     def complete(self, messages: list[dict], tools: list[dict]) -> LLMResponse:
         import litellm  # imported here so tests that use FakeLLM do not need it
 
-        response = litellm.completion(
-            model=self.model,
-            messages=messages,
-            tools=tools,
-            temperature=self.temperature,
-            num_retries=2,
-        )
+        response = self._completion_with_retries(litellm, messages, tools)
         message = response.choices[0].message
 
         tool_calls = []
