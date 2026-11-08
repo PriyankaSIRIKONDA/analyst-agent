@@ -5,8 +5,8 @@ running it read-only, repairing it when the database returns an error, and retur
 The repository also contains an evaluation harness that measures how often the agent is right, with
 confidence intervals, so the claim "it works" comes with a number and its uncertainty.
 
-Status: version 0. The agent, the guardrails, the harness and the tests are in place. No real
-evaluation has been run yet (see [Results](#results)).
+Status: version 0. The agent, the guardrails, the harness, the tests and a read-only MCP server are in
+place, with a first real evaluation on the 20-question demo set (see [Results](#results)).
 
 ## How it works
 
@@ -246,11 +246,32 @@ repository variable and the key from a secret such as `GEMINI_API_KEY`.
 
 ## Results
 
-Results will be filled in after the first real evaluation run. This section intentionally contains no numbers
-until `results/results.md` has been produced from real runs.
+Real runs with `gemini/gemini-3.5-flash-lite` on the 20 demo questions (`eval/demo_gold.jsonl`, synthetic
+database), code at commit `f59ef08`. Full reports: [`results/results.md`](results/results.md) (full vs no repair) and
+[`results/full_vs_nodocs.md`](results/full_vs_nodocs.md) (full vs no docs).
+
+| Run | Docs tool | SQL repair | Execution accuracy | 95% CI |
+|---|---|---|---|---|
+| `demo_full` | yes | yes | 100% (20/20) | [100%, 100%] |
+| `demo_nodocs` | no | yes | 80% (16/20) | [60%, 95%] |
+| `demo_norepair` | yes | no | 95% (19/20) | [85%, 100%] |
+
+Paired differences against `demo_full`, on the same 20 questions:
+
+- Without the docs tool: -20.0 points, 95% CI [-40.0, -5.0]. The CI excludes 0, so on this set the docs tool helps.
+- Without SQL repair: -5.0 points, 95% CI [-15.0, +0.0]. The CI includes 0, so there is no clear difference on this set.
+
+Per question in `demo_full`: median latency 19.6 s (p95 28.4 s), about 4,600 prompt tokens, and about US$0.002.
+
+Prompt-injection test, 8 Nov 2026 ([`results/injection_20261108_090932.md`](results/injection_20261108_090932.md)):
+on 20 adversarial questions the model attempted a write on 13. None was executed (the SHA-256 of the
+database file never changed), and 1 query hit the 5 s timeout. The defence is the database layer, not the prompt.
+
+Twenty questions on a small synthetic database is a small set: the intervals are wide, and 100% here says
+nothing about accuracy on a real warehouse. A reported BIRD run is the next step.
 
 ## Limitations of v0
 
 - The demo set is 20 questions on a small synthetic database; BIRD support exists but no BIRD run is reported here.
 - Keyword docs search only; no embeddings.
-- No tracing and no MCP server.
+- No tracing yet. The MCP server's HTTP transport has no authentication, so it is for local use only.
