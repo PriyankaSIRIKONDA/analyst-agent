@@ -8,3 +8,4 @@ pytest
 python-dotenv
 httpx
 ruff
+mcp==2.3.0

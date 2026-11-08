@@ -37,6 +37,7 @@ The loop stops after 8 model calls at most.
          +--------------+
 
  Entry points:  FastAPI (api.py)  POST /ask, GET /health
+                MCP server (mcp_server.py)  the four read-only tools for any MCP client
  Measured by:   eval/  (gold questions -> execution accuracy + bootstrap CI)
 ```
 
@@ -60,6 +61,7 @@ src/analyst_agent/
     llm.py      LiteLLM wrapper and FakeLLM for tests
     agent.py    the loop, repair budget, structured final answer, per-question statistics
     api.py      FastAPI app
+    mcp_server.py  read-only MCP server over the same tools
 eval/
     make_demo_db.py   builds data/demo.db (e-commerce, fixed seed)
     demo_gold.jsonl   20 questions with gold SQL
@@ -163,6 +165,48 @@ Runs 20 adversarial questions (write requests, instruction overrides, stacked st
 changes, ATTACH/PRAGMA/load_extension, runaway queries) on a temporary copy of the demo database.
 It counts the write attempts, the timeouts, and whether the database file hash changed (target: no
 write executed), and writes `results/injection_<stamp>.md`.
+
+## MCP server
+
+The agent's tools are also available as a read-only [MCP](https://modelcontextprotocol.io) server,
+so another AI client (Claude Code, Cursor, any MCP client) can explore the database itself:
+
+```powershell
+.venv\Scripts\python -m analyst_agent.mcp_server                      # stdio, the default
+.venv\Scripts\python -m analyst_agent.mcp_server --transport http      # http://127.0.0.1:8765/mcp
+.venv\Scripts\python -m analyst_agent.mcp_server --db my.db --no-docs  # another database
+```
+
+It exposes `list_tables`, `describe_table`, `run_sql` and, when a docs file is given,
+`search_docs`. It does not run the LLM agent: the calling client does the reasoning. Every call
+goes through the same `ToolBox` as the agent, so all the guardrails above apply unchanged. Every
+tool is annotated `readOnlyHint` and not destructive. A rejected or failing query comes back as an
+MCP error result that still carries the message, so the client can fix its SQL. The HTTP transport
+listens on 127.0.0.1 only and has no authentication, so do not expose it on a network.
+
+To add it to Claude Code, give the full path to the virtual environment's Python (the client may
+start the server from another folder):
+
+```powershell
+claude mcp add analyst-agent -- C:/path/to/analyst-agent/.venv/Scripts/python.exe -m analyst_agent.mcp_server
+```
+
+Clients configured with JSON take the same path (forward slashes work on Windows):
+
+```json
+{
+  "mcpServers": {
+    "analyst-agent": {
+      "command": "C:/path/to/analyst-agent/.venv/Scripts/python.exe",
+      "args": ["-m", "analyst_agent.mcp_server"]
+    }
+  }
+}
+```
+
+`tests/test_mcp_server.py` drives the server through the MCP SDK's in-memory client. It checks the
+tool list and annotations, the 50-row cap, the error results, and that write attempts (DELETE,
+DROP, stacked statements, ATTACH, `WITH ... DELETE`) leave the database file unchanged.
 
 ## Docker
 
