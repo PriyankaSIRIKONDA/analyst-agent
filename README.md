@@ -5,6 +5,17 @@ running it read-only, repairing it when the database returns an error, and retur
 The repository also contains an evaluation harness that measures how often the agent is right, with
 confidence intervals, so the claim "it works" comes with a number and its uncertainty.
 
+## At a glance
+
+- **What it does:** answers an English business question by exploring the database, writing SQL,
+  running it read-only, and returning the answer together with the SQL it used.
+- **Accuracy:** 20/20 on the demo set with the full agent. Without the docs tool it drops to 16/20
+  (paired difference −20 points, 95% CI [−40, −5]).
+- **Safety:** in a 20-question prompt-injection test the model tried to write on 13 questions. None
+  ran, because the database layer refuses everything except reads.
+- **Cost:** about US$0.002 and 20 s per question (median) with `gemini-3.5-flash-lite`.
+- **Stack:** Python, LiteLLM, SQLite, FastAPI, MCP, Docker, pytest (138 tests in CI).
+
 Status: version 0. The agent, the guardrails, the harness, the tests and a read-only MCP server are in
 place, with a first real evaluation on the 20-question demo set (see [Results](#results)).
 
@@ -259,7 +270,11 @@ database), code at commit `f59ef08`. Full reports: [`results/results.md`](result
 Paired differences against `demo_full`, on the same 20 questions:
 
 - Without the docs tool: -20.0 points, 95% CI [-40.0, -5.0]. The CI excludes 0, so on this set the docs tool helps.
-- Without SQL repair: -5.0 points, 95% CI [-15.0, +0.0]. The CI includes 0, so there is no clear difference on this set.
+- Without SQL repair: -5.0 points, 95% CI [-15.0, +0.0]. This does not measure the repair loop. In the
+  full run it never fired (0 repairs on all 20 questions), and the one question the no-repair run
+  missed was a wrong result, not an SQL error, so repair could not have fixed it. The gap is the model
+  answering differently from one run to the next. Measuring repair needs harder questions where the
+  first query fails, such as BIRD.
 
 Per question in `demo_full`: median latency 19.6 s (p95 28.4 s), about 4,600 prompt tokens, and about US$0.002.
 
