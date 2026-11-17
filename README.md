@@ -9,15 +9,19 @@ confidence intervals, so the claim "it works" comes with a number and its uncert
 
 - **What it does:** answers an English business question by exploring the database, writing SQL,
   running it read-only, and returning the answer together with the SQL it used.
-- **Accuracy:** 20/20 on the demo set with the full agent. Without the docs tool it drops to 16/20
-  (paired difference −20 points, 95% CI [−40, −5]).
+- **Accuracy:** 54.1% (80/148) on BIRD mini-dev questions, 95% CI [45.9%, 62.2%]. On BIRD, removing
+  the docs tool or the SQL repair loop makes no clear difference (paired 95% CIs [−3.4, +7.4] and
+  [−4.7, +4.7] points). On the 20-question demo set the full agent gets 20/20, and without the docs
+  tool it drops to 16/20 (−20 points, 95% CI [−40, −5]).
 - **Safety:** in a 20-question prompt-injection test the model tried to write on 13 questions. None
   ran, because the database layer refuses everything except reads.
-- **Cost:** about US$0.002 and 20 s per question (median) with `gemini-3.5-flash-lite`.
-- **Stack:** Python, LiteLLM, SQLite, FastAPI, MCP, Docker, pytest (138 tests in CI).
+- **Cost:** with `gemini-3.5-flash-lite`, the median is 27 s per BIRD question (20 s on the demo set), at
+  about US$0.004 (US$0.002) at list price. The runs here used the free tier.
+- **Stack:** Python, LiteLLM, SQLite, FastAPI, MCP, Docker, pytest (142 tests in CI).
 
 Status: version 0. The agent, the guardrails, the harness, the tests and a read-only MCP server are in
-place, with a first real evaluation on the 20-question demo set (see [Results](#results)).
+place, with real evaluations on 148 BIRD mini-dev questions and on the 20-question demo set
+(see [Results](#results)).
 
 ## How it works
 
@@ -157,7 +161,9 @@ prompt as a hint (`--no-evidence` removes it). `--sql-timeout 30` matches the 30
 official BIRD evaluation. `--min-interval` spaces the model calls so a free plan stays under its
 requests-per-minute limit: use 60 divided by that limit (4 seconds for 15 requests per minute).
 A run stops after 3 model errors in a row (often a daily quota) and keeps its finished rows;
-continue it later with the same command plus `--out <run file> --resume`.
+continue it later with the same command plus `--out <run file> --resume`. To compare two BIRD
+runs, pass both files to `eval/analyze.py`. `--exclude <id>` leaves a question out of both runs, and the
+report lists every question left out.
 
 The `bird` metric is the official BIRD execution accuracy: the predicted and gold result sets are
 compared as sets of raw tuples, with no rounding and ignoring row order and duplicates. The default
@@ -257,6 +263,69 @@ repository variable and the key from a secret such as `GEMINI_API_KEY`.
 
 ## Results
 
+### BIRD mini-dev, 148 questions
+
+Three runs of `gemini/gemini-3.5-flash-lite` on the BIRD gold file, 6-16 Nov 2026, with
+`--metric bird --sql-timeout 30` and the evidence hints on. Full reports:
+[`results/bird_full_vs_nodocs.md`](results/bird_full_vs_nodocs.md) and
+[`results/bird_full_vs_norepair.md`](results/bird_full_vs_norepair.md). The raw run files are
+`results/bird_full.jsonl`, `results/bird_nodocs.jsonl` and `results/bird_norepair.jsonl`.
+
+| Run | Docs tool | SQL repair | Execution accuracy | 95% CI |
+|---|---|---|---|---|
+| `bird_full` | yes | yes | 54.1% (80/148) | [45.9%, 62.2%] |
+| `bird_nodocs` | no | yes | 56.1% (83/148) | [48.0%, 64.9%] |
+| `bird_norepair` | yes | no | 54.1% (80/148) | [45.9%, 62.2%] |
+
+Paired differences against `bird_full`, on the same 148 questions:
+
+- Without the docs tool: +2.0 points, 95% CI [-3.4, +7.4].
+- Without SQL repair: +0.0 points, 95% CI [-4.7, +4.7]. The tie is a coincidence: 6 questions are
+  right only in `bird_full` and 6 only in `bird_norepair`.
+
+Both intervals include 0, so on BIRD neither part changes accuracy measurably. That is not what the
+demo set showed, and the run files suggest why:
+
+- Repair almost never triggers. `bird_full` used a repair on 6 of 148 questions, and 2 of those ended
+  correct. The 8 questions that ended on a SQL error without repair were wrong in `bird_full` too.
+- Each BIRD question comes with an evidence hint, such as "Male refers to gender = 'M'", which carries
+  much of what the docs say. This explanation is not tested yet: a run with `--no-evidence`, with and
+  without the docs tool, would test it.
+- Docs searches use up steps. `bird_full` called `search_docs` 0.71 times per question. Questions that
+  ran out of steps had searched 1.17 times on average, against 0.60 for the questions that finished.
+  Without the docs tool, 22 questions ran out of steps instead of 29.
+
+Where the errors are:
+
+- By difficulty in `bird_full`: simple 77.5% (40 questions), moderate 44.4% (72), challenging 47.2% (36).
+- Of the 68 wrong answers in `bird_full`, 29 are questions where the agent used all 8 steps without
+  calling `final_answer`, and 39 returned a different result from the gold query. No final SQL failed to run.
+- 56 questions are wrong in all three runs and 68 are right in all three. The other 24 change from one
+  run to another, so a difference of a few questions between two runs is within the noise. The paired
+  intervals show this.
+
+Per question in `bird_full`: median latency 27.2 s (p95 51.3 s), about 12,700 prompt tokens and 7.0 tool
+calls. LiteLLM prices this at about US$0.004 per question, but the runs used the free tier, so they cost nothing.
+
+How the runs were done:
+
+- `bird_701` is left out of all three runs (`eval/analyze.py ... --exclude bird_701`). Its gold query takes
+  0.35 s on SQLite 3.39 (Windows Python) but more than 5 minutes on SQLite 3.53 (the Linux Python used
+  for most runs). SQLite 3.53 runs its `MAX(Reputation)` subquery again for every row of `posts`
+  instead of once. I compared the plans of all 718 queries in the runs (the gold queries and every
+  query the agent wrote) on both versions: this was the only one whose outcome changed.
+- `bird_138` appears twice in the BIRD mini-dev file, so it is counted once. That leaves 148 questions.
+- On 9 Nov, Windows Smart App Control started blocking the compiled libraries in the virtual
+  environment, so the runs moved to WSL Ubuntu with the same library versions. In `bird_full`, 96
+  questions ran on Windows (commit `f59ef08`) and 52 on WSL (commit `e72132e`, which adds only the MCP
+  server and README changes). The two other runs ran entirely on WSL. The agent code is the same in
+  both commits. The run files record `e72132e`. On GitHub, that commit is `68c0cb2`: its message was
+  rewritten, but the files are identical.
+- On the free plan (500 requests a day), each run took several days and was continued with `--resume`.
+  Questions that hit a quota error were run again.
+
+### Demo set, 20 questions
+
 Real runs with `gemini/gemini-3.5-flash-lite` on the 20 demo questions (`eval/demo_gold.jsonl`, synthetic
 database), code at commit `f59ef08`. Full reports: [`results/results.md`](results/results.md) (full vs no repair) and
 [`results/full_vs_nodocs.md`](results/full_vs_nodocs.md) (full vs no docs).
@@ -283,10 +352,12 @@ on 20 adversarial questions the model attempted a write on 13. None was executed
 database file never changed), and 1 query hit the 5 s timeout. The defence is the database layer, not the prompt.
 
 Twenty questions on a small synthetic database is a small set: the intervals are wide, and 100% here says
-nothing about accuracy on a real warehouse. A reported BIRD run is the next step.
+nothing about accuracy on a real warehouse. The BIRD runs above are the better guide.
 
 ## Limitations of v0
 
-- The demo set is 20 questions on a small synthetic database; BIRD support exists but no BIRD run is reported here.
+- The BIRD results are one run per configuration, with one model, on 148 mini-dev questions, always with
+  the evidence hints. Running out of steps (29 of 68 wrong answers) is the largest single failure and is not fixed yet.
+- The demo set is 20 questions on a small synthetic database.
 - Keyword docs search only; no embeddings.
 - No tracing yet. The MCP server's HTTP transport has no authentication, so it is for local use only.

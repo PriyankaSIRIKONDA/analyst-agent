@@ -10,6 +10,7 @@ from analyze import (
     failure_reasons,
     pair_runs,
     paired_bootstrap_diff,
+    prepare_run,
     status_counts,
     warnings_for,
 )
@@ -115,3 +116,42 @@ def test_report_shows_config_and_the_new_sections():
     assert "model=test" in report
     for heading in ("Status of each run", "Failure reasons", "Accuracy by difficulty"):
         assert heading in report
+
+
+def test_prepare_run_excludes_ids_and_counts_a_repeated_question_once():
+    rows = [
+        _row("a", True, question="Q a"),
+        _row("b", False, question="Q b"),
+        _row("a", True, question="Q a"),  # the dataset lists question a twice
+        _row("c", True, question="Q c"),
+    ]
+    kept, excluded, collapsed = prepare_run(rows, {"c", "missing"})
+    assert [r["id"] for r in kept] == ["a", "b"]
+    assert excluded == ["c"]
+    assert collapsed == ["a"]
+
+
+def test_prepare_run_refuses_one_id_for_two_different_questions():
+    with pytest.raises(ValueError, match="two different questions"):
+        prepare_run([_row("a", True, question="one"), _row("a", True, question="two")], set())
+
+
+def test_runs_with_a_dataset_duplicate_can_be_paired_after_prepare():
+    first, _, _ = prepare_run([_row("a", True, question="Q"), _row("a", True, question="Q"),
+                               _row("b", False, question="R"), _row("x", True, question="X")],
+                              {"x"})
+    second, _, _ = prepare_run([_row("a", False, question="Q"), _row("b", True, question="R")],
+                               {"x"})
+    ids, a, b = pair_runs(first, second)
+    assert ids == ["a", "b"]
+
+
+def test_report_lists_left_out_questions_and_every_git_commit():
+    rows = _fake_run([True, False])
+    rows[1]["config"] = dict(rows[1]["config"], git_commit="bbb")
+    rows[0]["config"] = dict(rows[0]["config"], git_commit="aaa")
+    report = build_report({"r": rows}, {"r": (["bird_701"], ["bird_138"])})
+    assert "left out with --exclude: bird_701" in report
+    assert "duplicate question counted once: bird_138" in report
+    assert "aaa (1 rows) + bbb (1 rows)" in report
+    assert "Questions left out" not in build_report({"r": rows})

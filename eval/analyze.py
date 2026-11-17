@@ -3,8 +3,11 @@
 Usage:
     python eval/analyze.py results/run_A.jsonl
     python eval/analyze.py results/run_A.jsonl results/run_B.jsonl   # adds a paired comparison
+    python eval/analyze.py results/run_A.jsonl --exclude bird_701    # leave questions out
 
-Writes results/results.md. Every number in that file comes from the run files you pass in.
+Writes results/results.md (or --out). Every number in that file comes from the run files you
+pass in. A question id that appears twice with the same question (a duplicate in the source
+dataset) is counted once. Both of these steps are listed in the report.
 """
 
 from __future__ import annotations
@@ -24,6 +27,27 @@ ROOT = Path(__file__).resolve().parents[1]
 def load_run(path: Path) -> list[dict]:
     """Read a run_*.jsonl file written by run_eval.py."""
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def prepare_run(rows: list[dict], exclude: set[str]) -> tuple[list[dict], list[str], list[str]]:
+    """Drop excluded ids and count a repeated question once.
+
+    Returns (rows, excluded ids found, ids collapsed). Raises ValueError if one id holds two
+    different questions, because then the rows cannot be merged safely.
+    """
+    kept: dict[str, dict] = {}
+    excluded, collapsed = set(), set()
+    for row in rows:
+        qid = row["id"]
+        if qid in exclude:
+            excluded.add(qid)
+        elif qid not in kept:
+            kept[qid] = row
+        elif kept[qid].get("question") == row.get("question"):
+            collapsed.add(qid)
+        else:
+            raise ValueError(f"Question id {qid} is used for two different questions.")
+    return list(kept.values()), sorted(excluded), sorted(collapsed)
 
 
 def bootstrap_ci(
@@ -142,12 +166,30 @@ def pct(x: float) -> str:
 
 
 def config_section(runs: dict[str, list[dict]]) -> list[str]:
-    """The settings of each run (from its first row), so results.md explains itself."""
+    """The settings of each run, so results.md explains itself.
+
+    Settings come from the first row; the git commit is listed for every row, because a
+    resumed run can span commits.
+    """
     lines = ["## Run configuration", ""]
     for name, rows in runs.items():
-        config = rows[0].get("config", {}) if rows else {}
+        config = dict(rows[0].get("config", {})) if rows else {}
+        commits = Counter(r.get("config", {}).get("git_commit") for r in rows)
+        if len(commits) > 1:
+            config["git_commit"] = " + ".join(f"{c} ({n} rows)" for c, n in commits.items())
         lines.append(f"- `{name}`: " + (", ".join(f"{k}={v}" for k, v in config.items()) or "n/a"))
     return lines + [""]
+
+
+def left_out_section(notes: dict[str, tuple[list[str], list[str]]]) -> list[str]:
+    """One line per run that had questions excluded or duplicates collapsed."""
+    lines = []
+    for name, (excluded, collapsed) in notes.items():
+        if excluded:
+            lines.append(f"- `{name}`: left out with --exclude: {', '.join(excluded)}")
+        if collapsed:
+            lines.append(f"- `{name}`: duplicate question counted once: {', '.join(collapsed)}")
+    return ["## Questions left out", ""] + lines + [""] if lines else []
 
 
 def detail_sections(runs: dict[str, list[dict]]) -> list[str]:
@@ -171,13 +213,16 @@ def detail_sections(runs: dict[str, list[dict]]) -> list[str]:
     return lines
 
 
-def build_report(runs: dict[str, list[dict]]) -> str:
-    """Markdown text for results.md."""
+def build_report(
+    runs: dict[str, list[dict]], notes: dict[str, tuple[list[str], list[str]]] | None = None
+) -> str:
+    """Markdown text for results.md. `notes` comes from prepare_run, one entry per run."""
     summaries = {name: summarise(rows) for name, rows in runs.items()}
 
     title = f"## Execution accuracy (95% bootstrap CI, {N_RESAMPLES} resamples)"
     lines = ["# Results", ""]
     lines += config_section(runs)
+    lines += left_out_section(notes or {})
     lines += [title, ""]
     lines += [
         "| Run | Model | Docs | Repair | N | Accuracy | 95% CI |",
@@ -234,13 +279,18 @@ def main() -> None:
     )
     parser.add_argument("runs", nargs="+", type=Path, help="One or two run_*.jsonl files")
     parser.add_argument("--out", type=Path, default=ROOT / "results" / "results.md")
+    parser.add_argument("--exclude", nargs="+", default=[], metavar="ID",
+                        help="Question ids to leave out of every run (listed in the report)")
     args = parser.parse_args()
     if len(args.runs) > 2:
         parser.error("Pass one run, or two runs for a paired comparison.")
 
-    runs = {path.stem: load_run(path) for path in args.runs}
+    runs, notes = {}, {}
     try:
-        report = build_report(runs)
+        for path in args.runs:
+            rows, excluded, collapsed = prepare_run(load_run(path), set(args.exclude))
+            runs[path.stem], notes[path.stem] = rows, (excluded, collapsed)
+        report = build_report(runs, notes)
     except ValueError as exc:
         parser.error(str(exc))
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -249,6 +299,9 @@ def main() -> None:
     print(f"Wrote {args.out}")
     for warning in warnings_for(runs):
         print(warning)
+    unused = set(args.exclude) - {qid for excluded, _ in notes.values() for qid in excluded}
+    if unused:
+        print(f"WARNING: --exclude ids not found in any run: {', '.join(sorted(unused))}")
 
 
 if __name__ == "__main__":
