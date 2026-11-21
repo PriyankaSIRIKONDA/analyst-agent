@@ -2,7 +2,15 @@
 
 import json
 
-from analyst_agent.agent import Agent, AgentAnswer
+from analyst_agent.agent import (
+    FORCE_FINAL_ANSWER,
+    LAST_STEP_MESSAGE,
+    LAST_STEP_REFUSAL,
+    MAX_TRACE_ERROR_CHARS,
+    Agent,
+    AgentAnswer,
+    summarise_output,
+)
 from analyst_agent.llm import FakeLLM, LLMResponse, tool_turn
 from analyst_agent.tools import ToolBox
 
@@ -131,3 +139,55 @@ def test_no_docs_ablation_hides_search_docs_tool(db, toolbox):
 def test_result_is_json_serialisable(toolbox):
     result = Agent(FakeLLM([tool_turn(FINAL)]), toolbox).run("q")
     assert json.loads(json.dumps(result.to_dict()))["answer"]["sql"] == GOOD_SQL
+
+
+def test_last_step_forces_final_answer_and_rescues_the_answer(toolbox):
+    script = [tool_turn(("list_tables", {})) for _ in range(7)] + [tool_turn(FINAL)]
+    llm = FakeLLM(script)
+    result = Agent(llm, toolbox, max_steps=8).run("q")
+
+    assert result.status == "ok"
+    assert result.steps == 8
+    assert llm.tool_choices[:7] == [None] * 7
+    assert llm.tool_choices[7] == FORCE_FINAL_ANSWER
+    assert llm.calls[7][-1] == {"role": "user", "content": LAST_STEP_MESSAGE}
+
+
+def test_other_tools_are_refused_on_the_last_step(toolbox):
+    llm = FakeLLM([tool_turn(("list_tables", {})) for _ in range(8)])
+    result = Agent(llm, toolbox, max_steps=8).run("q")
+
+    assert result.status == "max_steps"
+    assert result.tool_calls[-1]["result"] == {"ok": False, "error": LAST_STEP_REFUSAL}
+    assert result.tool_calls[-2]["result"] == {"ok": True}
+
+
+def test_v0_loop_never_forces_the_last_step(toolbox):
+    llm = FakeLLM([tool_turn(("list_tables", {})) for _ in range(8)])
+    result = Agent(llm, toolbox, max_steps=8, finish_on_last_step=False).run("q")
+
+    assert result.status == "max_steps"
+    assert llm.tool_choices == [None] * 8
+    assert all(m.get("content") != LAST_STEP_MESSAGE for m in llm.calls[-1])
+    assert result.tool_calls[-1]["result"] == {"ok": True}
+
+
+def test_tool_results_are_summarised_in_the_trace(toolbox):
+    llm = FakeLLM([
+        tool_turn(("run_sql", {"sql": "SELECT * FROM itemz"})),
+        tool_turn(("run_sql", {"sql": GOOD_SQL})),
+        tool_turn(FINAL),
+    ])
+    result = Agent(llm, toolbox).run("q")
+    failed, worked, final = (c["result"] for c in result.tool_calls)
+
+    assert failed["ok"] is False and "no such table: itemz" in failed["error"]
+    assert worked == {"ok": True, "row_count": 1, "truncated": False}
+    assert final == {"ok": True}
+
+
+def test_trace_errors_are_cut_to_a_fixed_length():
+    summary = summarise_output("run_sql", {"ok": False, "error": "x" * 1000})
+    assert len(summary["error"]) == MAX_TRACE_ERROR_CHARS
+    docs_summary = summarise_output("search_docs", {"ok": True, "results": [1, 2]})
+    assert docs_summary == {"ok": True, "hits": 2}

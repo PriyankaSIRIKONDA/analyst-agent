@@ -84,9 +84,12 @@ class LiteLLMClient:
                 time.sleep(wait)
         self._last_call = time.monotonic()
 
-    def _completion_with_retries(self, litellm, messages: list[dict], tools: list[dict]):
+    def _completion_with_retries(
+        self, litellm, messages: list[dict], tools: list[dict], tool_choice: dict | None = None
+    ):
         """Call litellm.completion; retry transient errors with a growing wait."""
         retryable = retryable_exceptions(litellm)
+        extra = {"tool_choice": tool_choice} if tool_choice is not None else {}
         for attempt in range(len(RETRY_BACKOFF_S) + 1):
             self._wait_for_interval()
             try:
@@ -99,16 +102,20 @@ class LiteLLMClient:
                     # LiteLLM 1.106 imports its MCP proxy code (and the optional `mcp` package)
                     # for every call with tools unless this private flag is set.
                     _skip_mcp_handler=True,
+                    **extra,
                 )
             except retryable:
                 if attempt == len(RETRY_BACKOFF_S):
                     raise
                 time.sleep(RETRY_BACKOFF_S[attempt])
 
-    def complete(self, messages: list[dict], tools: list[dict]) -> LLMResponse:
+    def complete(
+        self, messages: list[dict], tools: list[dict], tool_choice: dict | None = None
+    ) -> LLMResponse:
+        """One model turn. `tool_choice` (OpenAI format) can force a specific tool."""
         import litellm  # imported here so tests that use FakeLLM do not need it
 
-        response = self._completion_with_retries(litellm, messages, tools)
+        response = self._completion_with_retries(litellm, messages, tools, tool_choice)
         message = response.choices[0].message
 
         tool_calls = []
@@ -140,9 +147,13 @@ class FakeLLM:
     def __init__(self, script: list[LLMResponse]):
         self.script = list(script)
         self.calls: list[list[dict]] = []  # the messages received at each turn
+        self.tool_choices: list[dict | None] = []  # the tool_choice of each turn
 
-    def complete(self, messages: list[dict], tools: list[dict]) -> LLMResponse:
+    def complete(
+        self, messages: list[dict], tools: list[dict], tool_choice: dict | None = None
+    ) -> LLMResponse:
         self.calls.append([dict(m) for m in messages])
+        self.tool_choices.append(tool_choice)
         if not self.script:
             raise RuntimeError("FakeLLM script is exhausted.")
         return self.script.pop(0)

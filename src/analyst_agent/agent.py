@@ -2,6 +2,8 @@
 
 The loop stops when the model calls ``final_answer`` with a valid structured answer,
 when it has used ``max_steps`` LLM calls, or when SQL errors exhaust the repair budget.
+On the last allowed call the model is offered only ``final_answer`` and told so, because in
+the v0 BIRD runs it often spent every step re-checking a query instead of answering.
 """
 
 from __future__ import annotations
@@ -51,7 +53,8 @@ class AgentResult:
     status: str = "no_answer"  # ok | max_steps | sql_error | llm_error | no_answer
     answer: AgentAnswer | None = None
     steps: int = 0  # number of LLM calls
-    tool_calls: list[dict] = field(default_factory=list)  # [{"name": ..., "arguments": ...}]
+    # [{"name": ..., "arguments": ..., "result": short summary of what the tool returned}]
+    tool_calls: list[dict] = field(default_factory=list)
     repairs_used: int = 0
     latency_ms: float = 0.0
     prompt_tokens: int = 0
@@ -64,6 +67,34 @@ class AgentResult:
         data = asdict(self)
         data["answer"] = self.answer.model_dump() if self.answer else None
         return data
+
+
+LAST_STEP_MESSAGE = (
+    "This is your last step. Call final_answer now with the best query you have already run. "
+    "No other tool is available."
+)
+LAST_STEP_REFUSAL = "Only final_answer is available on the last step."
+# OpenAI-style tool_choice; LiteLLM turns it into Gemini's mode ANY limited to final_answer.
+FORCE_FINAL_ANSWER = {"type": "function", "function": {"name": "final_answer"}}
+
+MAX_TRACE_ERROR_CHARS = 300
+
+
+def summarise_output(name: str, output: dict) -> dict:
+    """A short record of a tool result for the run files: enough for error analysis, not the data.
+
+    Errors keep their message (cut to 300 characters); run_sql keeps the row count and whether
+    the rows were cut at the limit; search_docs keeps the number of hits.
+    """
+    summary: dict = {"ok": bool(output.get("ok"))}
+    if not summary["ok"]:
+        summary["error"] = str(output.get("error", ""))[:MAX_TRACE_ERROR_CHARS]
+    elif name == "run_sql":
+        summary["row_count"] = len(output.get("rows") or [])
+        summary["truncated"] = bool(output.get("truncated"))
+    elif name == "search_docs":
+        summary["hits"] = len(output.get("results") or [])
+    return summary
 
 
 def build_system_prompt(has_docs: bool) -> str:
@@ -99,11 +130,14 @@ class Agent:
         toolbox: ToolBox,
         max_steps: int = MAX_STEPS,
         max_repairs: int = MAX_REPAIRS,
+        finish_on_last_step: bool = True,
     ):
         self.llm = llm
         self.toolbox = toolbox
         self.max_steps = max_steps
         self.max_repairs = max_repairs  # 0 turns the repair loop off (ablation)
+        # On the last step, offer only final_answer and say so (False: the v0 behaviour).
+        self.finish_on_last_step = finish_on_last_step
 
     def run(self, question: str) -> AgentResult:
         """Answer one question and return the answer plus all recorded statistics."""
@@ -116,8 +150,14 @@ class Agent:
         ]
 
         while result.steps < self.max_steps and result.status == "no_answer":
+            last_step = self.finish_on_last_step and result.steps == self.max_steps - 1
+            if last_step:
+                messages.append({"role": "user", "content": LAST_STEP_MESSAGE})
             try:
-                response = self.llm.complete(messages, tools)
+                if last_step:  # every tool stays declared, but the call must be final_answer
+                    response = self.llm.complete(messages, tools, tool_choice=FORCE_FINAL_ANSWER)
+                else:
+                    response = self.llm.complete(messages, tools)
             except Exception as exc:  # a failed API call should not crash a whole eval run
                 result.status = "llm_error"
                 result.error = f"{type(exc).__name__}: {exc}"
@@ -134,12 +174,18 @@ class Agent:
                 continue
 
             for call in response.tool_calls:
-                result.tool_calls.append({"name": call.name, "arguments": call.arguments})
                 if call.name == "final_answer":
                     tool_output = self._handle_final_answer(call.arguments, result)
+                elif last_step:  # the model asked for a tool it was not offered
+                    tool_output = {"ok": False, "error": LAST_STEP_REFUSAL}
                 else:
                     tool_output = self.toolbox.call(call.name, call.arguments)
                     self._handle_sql_error(call.name, tool_output, result)
+                result.tool_calls.append({
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "result": summarise_output(call.name, tool_output),
+                })
                 messages.append(
                     {
                         "role": "tool",

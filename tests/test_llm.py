@@ -98,3 +98,27 @@ def test_real_litellm_call_path_runs_offline(monkeypatch):
     client = LiteLLMClient(model="gemini/gemini-3.5-flash-lite")
     response = client.complete([{"role": "user", "content": "hi"}], tools)
     assert response.content == "ok"
+
+
+def test_tool_choice_is_sent_only_when_given(monkeypatch, sleeps):
+    seen = []
+    monkeypatch.setattr(litellm, "completion", lambda **kw: seen.append(kw) or _response())
+    client = LiteLLMClient(model="m")
+    client.complete([], [])
+    client.complete([], [], tool_choice={"type": "function", "function": {"name": "final_answer"}})
+    assert "tool_choice" not in seen[0]
+    assert seen[1]["tool_choice"]["function"]["name"] == "final_answer"
+
+
+def test_litellm_maps_a_forced_tool_for_gemini():
+    """The forced last step relies on LiteLLM turning tool_choice into Gemini's mode ANY."""
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import VertexGeminiConfig
+
+    from analyst_agent.agent import FORCE_FINAL_ANSWER
+
+    config = VertexGeminiConfig().map_tool_choice_values(
+        "gemini-3.5-flash-lite", FORCE_FINAL_ANSWER
+    )
+    calling = config["functionCallingConfig"]
+    assert calling["mode"] == "ANY"
+    assert calling["allowed_function_names"] == ["final_answer"]

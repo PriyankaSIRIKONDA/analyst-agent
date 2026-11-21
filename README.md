@@ -32,7 +32,11 @@ place, with real evaluations on 148 BIRD mini-dev questions and on the 20-questi
    (at most 3 repairs).
 5. `final_answer` returns `{answer, sql, tables_used}`, validated with pydantic.
 
-The loop stops after 8 model calls at most.
+The loop stops after 8 model calls at most. On the 8th call the model is told it is the last one, and
+`tool_choice` forces it to call `final_answer`. All tools stay declared, so the history stays
+valid. In the v0 BIRD runs (below), the agent often used all 8 calls re-checking a query and never
+answered; `--no-last-step-finish` restores that v0 loop. Each tool call in a run file also records a
+short summary of its result (ok or the error message, row count), for error analysis.
 
 ## Architecture
 
@@ -300,6 +304,10 @@ Where the errors are:
 - By difficulty in `bird_full`: simple 77.5% (40 questions), moderate 44.4% (72), challenging 47.2% (36).
 - Of the 68 wrong answers in `bird_full`, 29 are questions where the agent used all 8 steps without
   calling `final_answer`, and 39 returned a different result from the gold query. No final SQL failed to run.
+- Most step-limit failures are questions the agent never solved, not answers it forgot to give. I
+  scored the agent's queries offline for those 29 questions: the last query it ran was correct for 2,
+  and at least one of its queries was correct for 8. So a forced final answer can rescue at most a few
+  questions (2 to 8, about 1 to 5 points). That is smaller than what one 148-question run can detect.
 - 56 questions are wrong in all three runs and 68 are right in all three. The other 24 change from one
   run to another, so a difference of a few questions between two runs is within the noise. The paired
   intervals show this.
@@ -315,6 +323,7 @@ How the runs were done:
   instead of once. I compared the plans of all 718 queries in the runs (the gold queries and every
   query the agent wrote) on both versions: this was the only one whose outcome changed.
 - `bird_138` appears twice in the BIRD mini-dev file, so it is counted once. That leaves 148 questions.
+- All three runs used the v0 loop, without the forced last step described in [How it works](#how-it-works).
 - On 9 Nov, Windows Smart App Control started blocking the compiled libraries in the virtual
   environment, so the runs moved to WSL Ubuntu with the same library versions. In `bird_full`, 96
   questions ran on Windows (commit `f59ef08`) and 52 on WSL (commit `e72132e`, which adds only the MCP
@@ -357,7 +366,8 @@ nothing about accuracy on a real warehouse. The BIRD runs above are the better g
 ## Limitations of v0
 
 - The BIRD results are one run per configuration, with one model, on 148 mini-dev questions, always with
-  the evidence hints. Running out of steps (29 of 68 wrong answers) is the largest single failure and is not fixed yet.
+  the evidence hints. Running out of steps (29 of 68 wrong answers) is the largest single failure.
+  The forced last step makes the agent always answer, but it is not measured on BIRD yet.
 - The demo set is 20 questions on a small synthetic database.
 - Keyword docs search only; no embeddings.
 - No tracing yet. The MCP server's HTTP transport has no authentication, so it is for local use only.

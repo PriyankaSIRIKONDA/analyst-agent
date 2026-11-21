@@ -67,7 +67,7 @@ def test_oracle_scores_every_demo_question_correct(tmp_path):
     assert all(r["correct"] for r in rows)
     assert {r["config"]["model"] for r in rows} == {"oracle"}
     assert set(rows[0]["config"]) >= {
-        "use_docs", "use_repair", "use_evidence", "metric", "max_steps",
+        "use_docs", "use_repair", "use_evidence", "metric", "max_steps", "last_step_finish",
         "sql_timeout", "gold", "git_commit",
     }
 
@@ -144,3 +144,8 @@ def test_oracle_llm_has_two_turns():
     llm = oracle_llm("SELECT 1")
     assert len(llm.script) == 2
     assert build_config(parse_args(["--no-evidence", "--no-docs"]), "m")["use_evidence"] is False
+
+
+def test_last_step_finish_is_on_by_default_and_recorded():
+    assert build_config(parse_args([]), "m")["last_step_finish"] is True
+    assert build_config(parse_args(["--no-last-step-finish"]), "m")["last_step_finish"] is False
