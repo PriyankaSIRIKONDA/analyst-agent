@@ -4,6 +4,7 @@ The loop stops when the model calls ``final_answer`` with a valid structured ans
 when it has used ``max_steps`` LLM calls, or when SQL errors exhaust the repair budget.
 On the last allowed call the model is offered only ``final_answer`` and told so, because in
 the v0 BIRD runs it often spent every step re-checking a query instead of answering.
+The system prompt also carries answer-shape rules, added after the error analysis.
 """
 
 from __future__ import annotations
@@ -97,8 +98,25 @@ def summarise_output(name: str, output: dict) -> dict:
     return summary
 
 
-def build_system_prompt(has_docs: bool) -> str:
-    """Instructions for the model. Mentions search_docs only when that tool exists."""
+# Added after the error analysis of the v0 BIRD runs (results/error_analysis.md): 23 of the 56
+# questions every configuration got wrong had the right data in the wrong form (extra columns,
+# or a list where one answer was asked for), and some ignored a formula given in the hint.
+ANSWER_RULES = (
+    "Answer shape rules:\n"
+    "- Select only the columns the question asks for, in the order it asks for them. "
+    "Do not add ids, names, counts or other columns as context.\n"
+    "- If the question asks for one thing (which, who, the most, the highest, the lowest), "
+    "return only that row, for example with ORDER BY ... LIMIT 1.\n"
+    "- If the hint gives a formula or a definition, compute exactly that formula, "
+    "including any multiplication by 100, even if a stored column looks similar."
+)
+
+
+def build_system_prompt(has_docs: bool, answer_rules: bool = True) -> str:
+    """Instructions for the model. Mentions search_docs only when that tool exists.
+
+    answer_rules=False gives the v0 prompt, used for the paired comparison with the old runs.
+    """
     steps = ["1. Call list_tables, then describe_table for the tables you need."]
     if has_docs:
         steps.append("2. Call search_docs to check column meanings and business definitions.")
@@ -112,13 +130,14 @@ def build_system_prompt(has_docs: bool) -> str:
         "Finally call final_answer with a short answer, the exact SQL that produced it, "
         "and the tables it uses."
     )
-    return (
+    prompt = (
         "You are a careful data analyst. You answer business questions about a SQLite "
         "database by writing SQL.\n"
         + "\n".join(steps)
         + "\nRules: only read data; never guess values you have not seen in the results; "
         "answer only what was asked."
     )
+    return prompt + "\n" + ANSWER_RULES if answer_rules else prompt
 
 
 class Agent:
@@ -131,6 +150,7 @@ class Agent:
         max_steps: int = MAX_STEPS,
         max_repairs: int = MAX_REPAIRS,
         finish_on_last_step: bool = True,
+        answer_rules: bool = True,
     ):
         self.llm = llm
         self.toolbox = toolbox
@@ -138,14 +158,17 @@ class Agent:
         self.max_repairs = max_repairs  # 0 turns the repair loop off (ablation)
         # On the last step, offer only final_answer and say so (False: the v0 behaviour).
         self.finish_on_last_step = finish_on_last_step
+        # Add the answer-shape rules to the system prompt (False: the v0 prompt).
+        self.answer_rules = answer_rules
 
     def run(self, question: str) -> AgentResult:
         """Answer one question and return the answer plus all recorded statistics."""
         start = time.perf_counter()
         result = AgentResult(question=question)
         tools = self.toolbox.schemas() + [FINAL_ANSWER_SCHEMA]
+        system_prompt = build_system_prompt(self.toolbox.docs is not None, self.answer_rules)
         messages: list[dict] = [
-            {"role": "system", "content": build_system_prompt(self.toolbox.docs is not None)},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
         ]
 

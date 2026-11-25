@@ -10,6 +10,7 @@ from run_eval import (
     Resources,
     StoppedEarly,
     build_config,
+    finished_rows,
     load_gold,
     oracle_llm,
     parse_args,
@@ -68,7 +69,7 @@ def test_oracle_scores_every_demo_question_correct(tmp_path):
     assert {r["config"]["model"] for r in rows} == {"oracle"}
     assert set(rows[0]["config"]) >= {
         "use_docs", "use_repair", "use_evidence", "metric", "max_steps", "last_step_finish",
-        "sql_timeout", "gold", "git_commit",
+        "answer_rules", "sql_timeout", "gold", "git_commit",
     }
 
 
@@ -149,3 +150,17 @@ def test_oracle_llm_has_two_turns():
 def test_last_step_finish_is_on_by_default_and_recorded():
     assert build_config(parse_args([]), "m")["last_step_finish"] is True
     assert build_config(parse_args(["--no-last-step-finish"]), "m")["last_step_finish"] is False
+
+
+def test_answer_rules_are_on_by_default_and_recorded():
+    assert build_config(parse_args([]), "m")["answer_rules"] is True
+    assert build_config(parse_args(["--no-answer-rules"]), "m")["answer_rules"] is False
+
+
+def test_resume_refuses_a_file_from_before_the_answer_rules(tmp_path):
+    out = tmp_path / "old.jsonl"
+    config = build_config(parse_args([]), "m")
+    old_config = {k: v for k, v in config.items() if k != "answer_rules"}
+    out.write_text(json.dumps({"id": "a", "status": "ok", "config": old_config}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        finished_rows(out, config)

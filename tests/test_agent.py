@@ -3,12 +3,14 @@
 import json
 
 from analyst_agent.agent import (
+    ANSWER_RULES,
     FORCE_FINAL_ANSWER,
     LAST_STEP_MESSAGE,
     LAST_STEP_REFUSAL,
     MAX_TRACE_ERROR_CHARS,
     Agent,
     AgentAnswer,
+    build_system_prompt,
     summarise_output,
 )
 from analyst_agent.llm import FakeLLM, LLMResponse, tool_turn
@@ -191,3 +193,22 @@ def test_trace_errors_are_cut_to_a_fixed_length():
     assert len(summary["error"]) == MAX_TRACE_ERROR_CHARS
     docs_summary = summarise_output("search_docs", {"ok": True, "results": [1, 2]})
     assert docs_summary == {"ok": True, "hits": 2}
+
+
+def test_answer_rules_are_in_the_prompt_by_default():
+    for has_docs in (True, False):
+        with_rules = build_system_prompt(has_docs)
+        v0 = build_system_prompt(has_docs, answer_rules=False)
+        assert with_rules == v0 + "\n" + ANSWER_RULES
+        assert "only the columns the question asks for" in with_rules
+        assert "LIMIT 1" in with_rules and "100" in with_rules
+        assert v0.endswith("answer only what was asked.")  # the prompt of the v0 runs
+
+
+def test_agent_sends_the_prompt_it_was_given(toolbox):
+    llm_new, llm_v0 = FakeLLM([tool_turn(FINAL)]), FakeLLM([tool_turn(FINAL)])
+    Agent(llm_new, toolbox).run("q")
+    Agent(llm_v0, toolbox, answer_rules=False).run("q")
+
+    assert ANSWER_RULES in llm_new.calls[0][0]["content"]
+    assert ANSWER_RULES not in llm_v0.calls[0][0]["content"]

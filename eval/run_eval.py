@@ -5,6 +5,7 @@ Examples:
     python eval/run_eval.py --no-repair          # ablation: SQL errors are not repaired
     python eval/run_eval.py --no-docs            # ablation: search_docs is disabled
     python eval/run_eval.py --no-last-step-finish  # v0 loop: the last step is not forced
+    python eval/run_eval.py --no-answer-rules    # v0 prompt: no answer-shape rules
     python eval/run_eval.py --limit 3            # quick check on the first 3 questions
     python eval/run_eval.py --oracle             # no LLM: the gold SQL is replayed (must be 100%)
     python eval/run_eval.py --gold data/bird/bird150.jsonl --metric bird --min-interval 1.1
@@ -62,6 +63,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=MAX_STEPS)
     parser.add_argument("--no-last-step-finish", action="store_true",
                         help="v0 behaviour: do not force final_answer on the last step")
+    parser.add_argument("--no-answer-rules", action="store_true",
+                        help="v0 prompt: leave out the answer-shape rules")
     parser.add_argument("--min-interval", type=float, default=0.0,
                         help="Seconds between LLM calls (60 / your requests-per-minute limit)")
     parser.add_argument("--oracle", action="store_true",
@@ -139,6 +142,7 @@ def build_config(args: argparse.Namespace, model: str) -> dict:
         "metric": args.metric,
         "max_steps": args.max_steps,
         "last_step_finish": not args.no_last_step_finish,
+        "answer_rules": not args.no_answer_rules,
         "sql_timeout": args.sql_timeout,
         "gold": args.gold.name,
         "git_commit": git_short_hash(),
@@ -160,6 +164,7 @@ def run_question(
         max_steps=args.max_steps,
         max_repairs=0 if args.no_repair else MAX_REPAIRS,
         finish_on_last_step=not args.no_last_step_finish,
+        answer_rules=not args.no_answer_rules,
     )
     result = agent.run(question_text(item, use_evidence=not args.no_evidence))
     pred_sql = result.answer.sql if result.answer else None
@@ -190,7 +195,7 @@ class StoppedEarly(RuntimeError):
 # Settings that must match to continue a run file (the git commit may differ).
 RESUME_KEYS = (
     "model", "use_docs", "use_repair", "use_evidence", "metric", "max_steps", "last_step_finish",
-    "sql_timeout", "gold",
+    "answer_rules", "sql_timeout", "gold",
 )
 
 
