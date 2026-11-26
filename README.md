@@ -17,7 +17,7 @@ confidence intervals, so the claim "it works" comes with a number and its uncert
   ran, because the database layer refuses everything except reads.
 - **Cost:** with `gemini-3.5-flash-lite`, the median is 27 s per BIRD question (20 s on the demo set), at
   about US$0.004 (US$0.002) at list price. The runs here used the free tier.
-- **Stack:** Python, LiteLLM, SQLite, FastAPI, MCP, Docker, pytest (142 tests in CI).
+- **Stack:** Python, LiteLLM, SQLite, FastAPI, MCP, Docker, pytest (154 tests in CI).
 
 Status: version 0. The agent, the guardrails, the harness, the tests and a read-only MCP server are in
 place, with real evaluations on 148 BIRD mini-dev questions and on the 20-question demo set
