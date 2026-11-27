@@ -17,9 +17,16 @@ confidence intervals, so the claim "it works" comes with a number and its uncert
   ran, because the database layer refuses everything except reads.
 - **Cost:** with `gemini-3.5-flash-lite`, the median is 27 s per BIRD question (20 s on the demo set), at
   about US$0.004 (US$0.002) at list price. The runs here used the free tier.
-- **Stack:** Python, LiteLLM, SQLite, FastAPI, MCP, Docker, pytest (154 tests in CI).
+- **Stack:** Python, LangGraph, LiteLLM, MCP, SQLite (data), Postgres + pgvector (memory), FastAPI,
+  Langfuse, Docker, pytest (188 tests in CI).
 
-Status: version 0. The agent, the guardrails, the harness, the tests and a read-only MCP server are in
+Status: v1 in progress. Week 1 adds a LangGraph engine next to the v0 loop (see
+[LangGraph engine](#langgraph-engine)): router, SQL writer, SQL checker, executor and explainer, a
+Postgres checkpointer for conversations, step/time/retry limits, the MCP server as the only path to
+the data, per-node models, and an API with keys and rate limits. The v0 numbers below are for the
+v0 loop; the graph has passed the oracle run but not yet a real-model eval.
+
+Version 0: the agent, the guardrails, the harness, the tests and a read-only MCP server are in
 place, with real evaluations on 148 BIRD mini-dev questions and on the 20-question demo set
 (see [Results](#results)).
 
@@ -71,6 +78,44 @@ On top of that, the tool result sent to the model is bounded: at most 50 rows, a
 than 300 characters is cut (bytes are shown as `<N bytes>`). The scorer is not affected, it re-runs
 the SQL with its own large limit.
 
+## LangGraph engine
+
+```
+ question ─► router ──off_topic──► fixed reply
+               │ sql
+             schema        list_tables, describe_table, search_docs   (MCP, no LLM)
+               │
+          ┌► sql_writer    LLM writes one query (forced write_sql tool)
+  repair  │    │
+  (≤ 3)   ├─ sql_checker   SELECT/WITH check, then a dry run: SELECT * FROM (q) LIMIT 0
+          │    │ ok
+          └─ executor      run_sql                                    (MCP)
+               │ ok
+             explainer     LLM turns the rows into one or two sentences
+```
+
+- **Data access only through MCP.** `mcp_tools.py` is an MCP client of `mcp_server.py` (a stdio
+  subprocess in the API, in-process in tests and evals, or `MCP_URL` for a running server), so the
+  guardrails of `db.py` are the only path to the database for the graph too.
+- **Limits.** At most 12 node runs per question (`max_steps`, plus LangGraph's `recursion_limit` as a
+  backstop), at most 3 repairs, a timeout per node (20–45 s) and a `RetryPolicy` (3 attempts) for
+  timeouts, MCP transport errors and provider errors such as rate limits. A node that still fails
+  ends the run with `timeout`, `llm_error` or `tool_error` instead of crashing the request.
+- **Models per node.** `models.py` reads `MODEL` and, optionally, `MODEL_ROUTER`, `MODEL_SQL_WRITER`,
+  `MODEL_EXPLAINER` and `MODEL_FALLBACK` (all LiteLLM names: Gemini, Mistral, Groq, Bedrock, ...).
+- **Memory.** State is checkpointed per thread: Postgres when `DATABASE_URL` is set, memory
+  otherwise. A follow-up ("and last month?") shows the writer the last 3 questions, SQL and answers.
+  In the API, thread ids are private to the API key that created them.
+- **Tracing.** With `LANGFUSE_*` set, each run is a Langfuse trace with a span per node, and LiteLLM
+  logs every model call with tokens, cost and latency.
+
+Run it on the demo questions and compare it with the v0 loop:
+
+```powershell
+.venv\Scripts\python eval\run_eval.py --engine graph --out results\run_graph.jsonl
+.venv\Scripts\python eval\analyze.py results\run_graph.jsonl results\demo_full.jsonl
+```
+
 ## Repository layout
 
 ```
@@ -78,8 +123,14 @@ src/analyst_agent/
     db.py       read-only connection, run_sql with guardrails
     tools.py    the four tools, their JSON schemas, BM25 docs search
     llm.py      LiteLLM wrapper and FakeLLM for tests
-    agent.py    the loop, repair budget, structured final answer, per-question statistics
-    api.py      FastAPI app
+    agent.py    the v0 loop, repair budget, structured final answer, per-question statistics
+    graph.py    the LangGraph engine (nodes, edges, limits, GraphAgent)
+    mcp_tools.py   MCP client the graph uses for every database call
+    models.py   which LiteLLM model each node uses
+    checkpoint.py  Postgres (or memory) checkpointer
+    security.py API keys (hashed) and per-key rate limits
+    observability.py  Langfuse tracing, on when its keys are set
+    api.py      FastAPI app: /ask, /health, /ready
     mcp_server.py  read-only MCP server over the same tools
 eval/
     make_demo_db.py   builds data/demo.db (e-commerce, fixed seed)
@@ -131,10 +182,20 @@ and `MODEL` in LiteLLM format (for example `gemini/gemini-3.5-flash-lite`). The 
 .venv\Scripts\python eval\analyze.py results\run_<stamp>.jsonl
 .venv\Scripts\python eval\analyze.py results\run_<full>.jsonl results\run_<ablation>.jsonl
 
-# 5. Serve the API
+# 5. Serve the API: make a key, put the printed name:hash in API_KEYS in .env, then start it
+.venv\Scripts\python -m analyst_agent.security new-key siri
 .venv\Scripts\python -m uvicorn analyst_agent.api:app --reload
-# then:  POST http://127.0.0.1:8000/ask   {"question": "How many customers live in Germany?"}
+# then:  POST http://127.0.0.1:8000/ask  with header X-API-Key: <key>
+#        {"question": "How many customers live in Germany?"}
+#        and, for a follow-up, {"question": "And in France?", "thread_id": "<from the answer>"}
 ```
+
+The API refuses questions when no key is configured (set `AUTH_DISABLED=true` only on your own
+machine). Each key may ask `RATE_LIMIT_PER_MINUTE` (10) questions a minute and `DAILY_QUERY_CAP`
+(200) a day; past that it gets 429 with `Retry-After`. Every response carries `X-Request-ID`, and each
+request and answer is logged as one JSON line. Error responses give a status and the request id, never
+the provider's error text. `GET /health` is liveness, `GET /ready` shows the checkpointer, MCP
+transport and models.
 
 ## Oracle smoke test (no API key)
 
@@ -235,12 +296,15 @@ DROP, stacked statements, ATTACH, `WITH ... DELETE`) leave the database file unc
 copy .env.example .env      # put your key in .env
 docker compose up --build
 # then, from another terminal (PowerShell):
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/ask -ContentType 'application/json' -Body '{"question": "How many customers live in Germany?"}'
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/ask -Headers @{'X-API-Key'='<key>'} -ContentType 'application/json' -Body '{"question": "How many customers live in Germany?"}'
 # or on macOS/Linux:
-curl -X POST http://localhost:8000/ask -H 'Content-Type: application/json' -d '{"question": "How many customers live in Germany?"}'
+curl -X POST http://localhost:8000/ask -H 'X-API-Key: <key>' -H 'Content-Type: application/json' -d '{"question": "How many customers live in Germany?"}'
 ```
 
-The image contains `src/` and `data/` only; `.env` is read at run time by Compose, never copied.
+Compose starts Postgres with pgvector (`pgvector/pgvector:pg17`, port 5432 on localhost only) and
+points the API's `DATABASE_URL` at it, so conversations survive restarts. pgvector is enabled now
+for the RAG store of week 2. The image contains `src/` and `data/` only and runs as a non-root user;
+`.env` is read at run time by Compose, never copied.
 
 ## Regression gate
 
@@ -370,4 +434,8 @@ nothing about accuracy on a real warehouse. The BIRD runs above are the better g
   The forced last step makes the agent always answer, but it is not measured on BIRD yet.
 - The demo set is 20 questions on a small synthetic database.
 - Keyword docs search only; no embeddings.
-- No tracing yet. The MCP server's HTTP transport has no authentication, so it is for local use only.
+- The MCP server's HTTP transport has no authentication, so it is for local use only (the API starts
+  its own server over stdio).
+- The rate limiter counts in memory, so it holds per API instance; with several instances it moves to
+  Postgres or Redis.
+- The business data is still SQLite; it moves to Postgres with a read-only role in week 5.

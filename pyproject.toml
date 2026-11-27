@@ -2,14 +2,14 @@
 name = "analyst-agent"
 version = "0.1.0"
 description = "A tool-calling SQL analyst agent with an evaluation harness"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [project.scripts]
 analyst-agent-mcp = "analyst_agent.mcp_server:main"
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 src = ["src", "eval", "tests"]
 
 [tool.ruff.lint]

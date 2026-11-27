@@ -9,3 +9,10 @@ python-dotenv
 httpx
 ruff
 mcp==2.3.0
+# LangGraph engine (graph.py), Postgres checkpointer, tracing
+langgraph==1.2.24
+langgraph-checkpoint==4.3.2
+langgraph-checkpoint-postgres==3.2.1
+psycopg[binary,pool]==3.3.9
+psycopg-pool==3.3.3
+langfuse==5.2.0

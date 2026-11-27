@@ -8,6 +8,7 @@ Examples:
     python eval/run_eval.py --no-answer-rules    # v0 prompt: no answer-shape rules
     python eval/run_eval.py --limit 3            # quick check on the first 3 questions
     python eval/run_eval.py --oracle             # no LLM: the gold SQL is replayed (must be 100%)
+    python eval/run_eval.py --engine graph       # the LangGraph engine instead of the v0 loop
     python eval/run_eval.py --gold data/bird/bird150.jsonl --metric bird --min-interval 1.1
 
 A gold row may carry "db", "docs" and "evidence". "db" and "docs" replace --db and --docs for
@@ -17,6 +18,7 @@ that row; "evidence" is appended to the question as a hint unless --no-evidence 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import subprocess
 import sys
@@ -30,7 +32,10 @@ from dotenv import load_dotenv  # noqa: E402
 
 from analyst_agent.agent import MAX_REPAIRS, MAX_STEPS, Agent  # noqa: E402
 from analyst_agent.db import DEFAULT_TIMEOUT_S, Database  # noqa: E402
+from analyst_agent.graph import GraphAgent, GraphLimits  # noqa: E402
 from analyst_agent.llm import FakeLLM, LiteLLMClient, tool_turn  # noqa: E402
+from analyst_agent.mcp_tools import MCPTools  # noqa: E402
+from analyst_agent.models import ModelConfig  # noqa: E402
 from analyst_agent.tools import DocsIndex, ToolBox  # noqa: E402
 from score import execution_match  # noqa: E402
 
@@ -54,6 +59,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=ROOT / "results")
     parser.add_argument("--out", type=Path, default=None, help="Output file (default: run_<stamp>)")
     parser.add_argument("--model", default=None, help="Default: MODEL from .env")
+    parser.add_argument("--engine", choices=["loop", "graph"], default="loop",
+                        help="loop: the v0 tool loop (agent.py); graph: the LangGraph engine")
     parser.add_argument("--limit", type=int, default=None, help="Only run the first N questions")
     parser.add_argument("--no-repair", action="store_true", help="Disable the SQL repair loop")
     parser.add_argument("--no-docs", action="store_true", help="Disable the search_docs tool")
@@ -132,9 +139,19 @@ def oracle_llm(gold_sql: str) -> FakeLLM:
     ])
 
 
+def oracle_graph_llms(gold_sql: str) -> dict:
+    """Scripted models for the graph: route to SQL, write the gold SQL, answer 'oracle'."""
+    return {
+        "router": FakeLLM([tool_turn(("route", {"route": "sql"}))]),
+        "sql_writer": FakeLLM([tool_turn(("write_sql", {"sql": gold_sql, "tables_used": []}))]),
+        "explainer": FakeLLM([tool_turn(("final_answer", {"answer": "oracle"}))]),
+    }
+
+
 def build_config(args: argparse.Namespace, model: str) -> dict:
     """Settings recorded in every row, so a run file explains itself."""
     return {
+        "engine": args.engine,
         "model": model,
         "use_docs": not args.no_docs,
         "use_repair": not args.no_repair,
@@ -157,16 +174,10 @@ def run_question(
     `llm` is None in oracle mode: a scripted model is made for the row.
     """
     db = resources.database(item)
-    toolbox = ToolBox(db, resources.docs(item), sql_timeout_s=args.sql_timeout)
-    agent = Agent(
-        llm if llm is not None else oracle_llm(item["gold_sql"]),
-        toolbox,
-        max_steps=args.max_steps,
-        max_repairs=0 if args.no_repair else MAX_REPAIRS,
-        finish_on_last_step=not args.no_last_step_finish,
-        answer_rules=not args.no_answer_rules,
-    )
-    result = agent.run(question_text(item, use_evidence=not args.no_evidence))
+    if args.engine == "graph":
+        result = run_graph_question(item, args, resources, llm)
+    else:
+        result = run_loop_question(item, args, resources, llm)
     pred_sql = result.answer.sql if result.answer else None
     score = execution_match(db, item["gold_sql"], pred_sql, metric=args.metric)
     return {
@@ -179,6 +190,36 @@ def run_question(
         "config": config,
         **score,
     }
+
+
+def run_graph_question(item: dict, args: argparse.Namespace, resources: Resources, llms):
+    """The LangGraph engine, reaching the database through the MCP server (in process)."""
+    db_path = resources.database(item).path
+    docs_path = None if args.no_docs else (item.get("docs") or args.docs)
+    limits = GraphLimits(max_repairs=0 if args.no_repair else MAX_REPAIRS)
+    question = question_text(item, use_evidence=not args.no_evidence)
+
+    async def go():
+        async with MCPTools.in_process(db_path, docs_path, args.sql_timeout) as tools:
+            agent = GraphAgent(llms or oracle_graph_llms(item["gold_sql"]), tools, limits=limits)
+            return await agent.arun(question)
+
+    return asyncio.run(go())
+
+
+def run_loop_question(item: dict, args: argparse.Namespace, resources: Resources, llm):
+    """The v0 tool loop (agent.py), calling the tools directly."""
+    db = resources.database(item)
+    toolbox = ToolBox(db, resources.docs(item), sql_timeout_s=args.sql_timeout)
+    agent = Agent(
+        llm if llm is not None else oracle_llm(item["gold_sql"]),
+        toolbox,
+        max_steps=args.max_steps,
+        max_repairs=0 if args.no_repair else MAX_REPAIRS,
+        finish_on_last_step=not args.no_last_step_finish,
+        answer_rules=not args.no_answer_rules,
+    )
+    return agent.run(question_text(item, use_evidence=not args.no_evidence))
 
 
 def output_path(args: argparse.Namespace) -> Path:
@@ -194,8 +235,8 @@ class StoppedEarly(RuntimeError):
 
 # Settings that must match to continue a run file (the git commit may differ).
 RESUME_KEYS = (
-    "model", "use_docs", "use_repair", "use_evidence", "metric", "max_steps", "last_step_finish",
-    "answer_rules", "sql_timeout", "gold",
+    "engine", "model", "use_docs", "use_repair", "use_evidence", "metric", "max_steps",
+    "last_step_finish", "answer_rules", "sql_timeout", "gold",
 )
 
 
@@ -210,7 +251,8 @@ def finished_rows(out_path: Path, config: dict) -> list[dict]:
     rows = [json.loads(line) for line in lines if line.strip()]
     wanted = {k: config.get(k) for k in RESUME_KEYS}
     for row in rows:
-        found = {k: row["config"].get(k) for k in RESUME_KEYS}
+        # run files written before the graph engine existed have no "engine": they are "loop"
+        found = {k: row["config"].get(k, "loop" if k == "engine" else None) for k in RESUME_KEYS}
         if found != wanted:
             raise SystemExit(f"Cannot resume {out_path}: it has other settings ({found}).")
     return [row for row in rows if row["status"] != "llm_error"]
@@ -227,6 +269,9 @@ def run_all(args: argparse.Namespace) -> Path:
         raise SystemExit("--resume needs --out (the run file to continue).")
     if args.oracle:
         llm, model = None, "oracle"
+    elif args.engine == "graph":
+        models = ModelConfig.from_env(args.model)
+        llm, model = models.clients(min_interval_s=args.min_interval), models.sql_writer
     else:
         llm = LiteLLMClient(model=args.model, min_interval_s=args.min_interval)
         model = llm.model
