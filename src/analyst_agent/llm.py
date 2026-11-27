@@ -1,11 +1,13 @@
 """Thin wrapper over LiteLLM with tool calling, plus a scripted FakeLLM for tests.
 
-Both classes have the same method, ``complete(messages, tools) -> LLMResponse``,
-so the agent does not care which one it receives.
+Both classes have the same methods, ``complete(messages, tools) -> LLMResponse`` and its
+async twin ``acomplete``, so the agent and the graph do not care which one they receive.
+The LangGraph engine (graph.py) uses ``acomplete`` so that per-node timeouts can cancel a call.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -70,10 +72,18 @@ class LiteLLMClient:
         model: str | None = None,
         temperature: float = 0.0,
         min_interval_s: float = 0.0,
+        fallback_model: str | None = None,
+        request_timeout_s: float | None = None,
+        backoff_s: tuple[float, ...] = RETRY_BACKOFF_S,
     ):
         self.model = model or os.getenv("MODEL") or DEFAULT_MODEL  # empty MODEL -> default
         self.temperature = temperature
         self.min_interval_s = min_interval_s  # minimum gap between two calls (rate limits)
+        # Tried once when the main model still fails after its retries (e.g. a Groq model).
+        self.fallback_model = fallback_model or None
+        self.request_timeout_s = request_timeout_s  # passed to LiteLLM as `timeout`
+        # Waits before each retry. The graph passes () because its nodes retry themselves.
+        self.backoff_s = tuple(backoff_s)
         self._last_call = None
 
     def _wait_for_interval(self) -> None:
@@ -84,38 +94,76 @@ class LiteLLMClient:
                 time.sleep(wait)
         self._last_call = time.monotonic()
 
+    async def _await_interval(self) -> None:
+        """Async version of _wait_for_interval (the time slot is reserved before sleeping)."""
+        if self.min_interval_s > 0 and self._last_call is not None:
+            wait = self.min_interval_s - (time.monotonic() - self._last_call)
+            self._last_call = time.monotonic() + max(wait, 0)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            return
+        self._last_call = time.monotonic()
+
+    def _kwargs(self, model: str, messages, tools, tool_choice) -> dict:
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "temperature": self.temperature,
+            "num_retries": 0,  # we retry here, so litellm must not retry as well
+            # LiteLLM 1.106 imports its MCP proxy code (and the optional `mcp` package)
+            # for every call with tools unless this private flag is set.
+            "_skip_mcp_handler": True,
+        }
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        if self.request_timeout_s is not None:
+            kwargs["timeout"] = self.request_timeout_s
+        return kwargs
+
+    def _models(self) -> list[str]:
+        return [self.model] + ([self.fallback_model] if self.fallback_model else [])
+
     def _completion_with_retries(
         self, litellm, messages: list[dict], tools: list[dict], tool_choice: dict | None = None
     ):
-        """Call litellm.completion; retry transient errors with a growing wait."""
+        """Call litellm.completion; retry transient errors with a growing wait, then fall back."""
         retryable = retryable_exceptions(litellm)
-        extra = {"tool_choice": tool_choice} if tool_choice is not None else {}
-        for attempt in range(len(RETRY_BACKOFF_S) + 1):
-            self._wait_for_interval()
-            try:
-                return litellm.completion(
-                    model=self.model,
-                    messages=messages,
-                    tools=tools,
-                    temperature=self.temperature,
-                    num_retries=0,  # we retry here, so litellm must not retry as well
-                    # LiteLLM 1.106 imports its MCP proxy code (and the optional `mcp` package)
-                    # for every call with tools unless this private flag is set.
-                    _skip_mcp_handler=True,
-                    **extra,
-                )
-            except retryable:
-                if attempt == len(RETRY_BACKOFF_S):
-                    raise
-                time.sleep(RETRY_BACKOFF_S[attempt])
+        models = self._models()
+        for index, model in enumerate(models):
+            for attempt in range(len(self.backoff_s) + 1):
+                self._wait_for_interval()
+                try:
+                    return litellm.completion(**self._kwargs(model, messages, tools, tool_choice))
+                except retryable:
+                    if attempt < len(self.backoff_s):
+                        time.sleep(self.backoff_s[attempt])
+                    elif index == len(models) - 1:
+                        raise
+        raise AssertionError("unreachable")
 
-    def complete(
-        self, messages: list[dict], tools: list[dict], tool_choice: dict | None = None
-    ) -> LLMResponse:
-        """One model turn. `tool_choice` (OpenAI format) can force a specific tool."""
-        import litellm  # imported here so tests that use FakeLLM do not need it
+    async def _acompletion_with_retries(
+        self, litellm, messages: list[dict], tools: list[dict], tool_choice: dict | None = None
+    ):
+        """Async twin of _completion_with_retries."""
+        retryable = retryable_exceptions(litellm)
+        models = self._models()
+        for index, model in enumerate(models):
+            for attempt in range(len(self.backoff_s) + 1):
+                await self._await_interval()
+                try:
+                    return await litellm.acompletion(
+                        **self._kwargs(model, messages, tools, tool_choice)
+                    )
+                except retryable:
+                    if attempt < len(self.backoff_s):
+                        await asyncio.sleep(self.backoff_s[attempt])
+                    elif index == len(models) - 1:
+                        raise
+        raise AssertionError("unreachable")
 
-        response = self._completion_with_retries(litellm, messages, tools, tool_choice)
+    @staticmethod
+    def _to_response(litellm, response) -> LLMResponse:
         message = response.choices[0].message
 
         tool_calls = []
@@ -140,11 +188,29 @@ class LiteLLMClient:
             cost_usd=cost,
         )
 
+    def complete(
+        self, messages: list[dict], tools: list[dict], tool_choice: dict | None = None
+    ) -> LLMResponse:
+        """One model turn. `tool_choice` (OpenAI format) can force a specific tool."""
+        import litellm  # imported here so tests that use FakeLLM do not need it
+
+        response = self._completion_with_retries(litellm, messages, tools, tool_choice)
+        return self._to_response(litellm, response)
+
+    async def acomplete(
+        self, messages: list[dict], tools: list[dict], tool_choice: dict | None = None
+    ) -> LLMResponse:
+        """Async version of complete(), cancellable by the graph's per-node timeout."""
+        import litellm
+
+        response = await self._acompletion_with_retries(litellm, messages, tools, tool_choice)
+        return self._to_response(litellm, response)
+
 
 class FakeLLM:
     """Returns pre-written responses in order. Used by the tests and offline demos."""
 
-    def __init__(self, script: list[LLMResponse]):
+    def __init__(self, script: list[LLMResponse | BaseException]):
         self.script = list(script)
         self.calls: list[list[dict]] = []  # the messages received at each turn
         self.tool_choices: list[dict | None] = []  # the tool_choice of each turn
@@ -156,7 +222,15 @@ class FakeLLM:
         self.tool_choices.append(tool_choice)
         if not self.script:
             raise RuntimeError("FakeLLM script is exhausted.")
-        return self.script.pop(0)
+        turn = self.script.pop(0)
+        if isinstance(turn, BaseException):  # lets tests script a failing call
+            raise turn
+        return turn
+
+    async def acomplete(
+        self, messages: list[dict], tools: list[dict], tool_choice: dict | None = None
+    ) -> LLMResponse:
+        return self.complete(messages, tools, tool_choice)
 
 
 def tool_turn(*calls: tuple[str, dict]) -> LLMResponse:
