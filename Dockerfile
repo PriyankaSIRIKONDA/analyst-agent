@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -9,8 +9,14 @@ COPY src/ src/
 COPY data/ data/
 
 # api.py computes ROOT = Path(__file__).parents[2], which must be /app, so the package
-# is imported from /app/src and not installed into site-packages.
-ENV PYTHONPATH=/app/src
+# is imported from /app/src and not installed into site-packages. The MCP server subprocess
+# inherits PYTHONPATH, so it finds the package too.
+ENV PYTHONPATH=/app/src \
+    PYTHONUNBUFFERED=1
+
+# Never run as root in the container.
+RUN useradd --create-home --uid 10001 app
+USER app
 
 EXPOSE 8000
 

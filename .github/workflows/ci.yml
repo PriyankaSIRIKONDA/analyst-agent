@@ -7,12 +7,27 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      # Real Postgres for the checkpointer test (tests/test_checkpoint.py).
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: analyst
+          POSTGRES_PASSWORD: analyst
+          POSTGRES_DB: analyst
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U analyst" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://analyst:analyst@localhost:5432/analyst
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
@@ -26,10 +41,12 @@ jobs:
       - name: Tests (pytest, FakeLLM only, no API keys needed)
         run: pytest -q
 
-      - name: Smoke eval with the oracle (no API key)
+      - name: Smoke eval with the oracle (no API key), both engines
         run: |
           python eval/run_eval.py --oracle --out results/ci/oracle.jsonl
           python eval/check_regression.py results/ci/oracle.jsonl --min-accuracy 1.0
+          python eval/run_eval.py --oracle --engine graph --out results/ci/oracle_graph.jsonl
+          python eval/check_regression.py results/ci/oracle_graph.jsonl --min-accuracy 1.0
 
   docker:
     runs-on: ubuntu-latest
@@ -43,7 +60,7 @@ jobs:
         run: |
           docker run -d --name analyst-agent -p 8000:8000 analyst-agent
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:8000/health; then
+            if curl -fsS http://localhost:8000/ready; then
               echo
               exit 0
             fi

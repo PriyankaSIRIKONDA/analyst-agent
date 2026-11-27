@@ -1,4 +1,22 @@
 services:
+  # One Postgres for the app: LangGraph checkpoints now, the pgvector RAG store in week 2.
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: analyst
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-analyst-local-only}
+      POSTGRES_DB: analyst
+    ports:
+      - "127.0.0.1:5432:5432"  # local only
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analyst -d analyst"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   api:
     build: .
     ports:
@@ -6,12 +24,20 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      DATABASE_URL: postgresql://analyst:${POSTGRES_PASSWORD:-analyst-local-only}@postgres:5432/analyst
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"
       interval: 15s
       timeout: 5s
       retries: 3
+
+volumes:
+  pgdata:

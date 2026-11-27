@@ -4,6 +4,12 @@ name: Eval
 # gemini/gemini-3.5-flash-lite) and the matching API key secret (for example GEMINI_API_KEY).
 on:
   workflow_dispatch:
+    inputs:
+      engine:
+        description: "loop (v0 tool loop) or graph (LangGraph engine)"
+        default: loop
+        type: choice
+        options: [loop, graph]
 
 jobs:
   eval:
@@ -12,12 +18,13 @@ jobs:
       MODEL: ${{ vars.MODEL }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
@@ -26,7 +33,7 @@ jobs:
           pip install -e .
 
       - name: Run the demo evaluation
-        run: python eval/run_eval.py --min-interval ${{ vars.MIN_INTERVAL || '4' }} --out results/ci/eval_run.jsonl
+        run: python eval/run_eval.py --engine ${{ inputs.engine }} --min-interval ${{ vars.MIN_INTERVAL || '4' }} --out results/ci/eval_run.jsonl
 
       - name: Check against the baseline
         run: python eval/check_regression.py results/ci/eval_run.jsonl --baseline eval/baseline.json
