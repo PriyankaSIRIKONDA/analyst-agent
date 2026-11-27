@@ -33,3 +33,15 @@ def toolbox(db) -> ToolBox:
         ]
     )
     return ToolBox(db, docs)
+
+
+@pytest.fixture
+def docs_file(tmp_path):
+    """A docs markdown file for the tiny database (for the MCP server)."""
+    path = tmp_path / "docs.md"
+    path.write_text(
+        "# Intro\nA tiny shop.\n\n## Table items\nProducts for sale. `price` is in euros.\n\n"
+        "## Business definitions\nRevenue means the sum of price.\n",
+        encoding="utf-8",
+    )
+    return path
